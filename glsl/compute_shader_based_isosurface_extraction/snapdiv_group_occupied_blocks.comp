@@ -1,0 +1,63 @@
+#version 460 core
+
+#extension GL_NV_gpu_shader5 : require
+
+#include "../shader_includes/atomic_counters.glsl"
+#include "../shader_includes/per_frame_indirect_draw_parameter_ssbo.glsl"
+
+uint32_t snapdiv(uint32_t unaligned_input, uint32_t alignment)
+{
+  return (unaligned_input + alignment - 1) / alignment;
+}
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+  uint32_t total_num_occupied_blocks           = persistent_extraction_num_occupied_blocks_atomic_counter;
+  uint32_t total_num_groups_of_occupied_blocks = snapdiv(total_num_occupied_blocks, 32);
+  
+  num_filtered_blocks_counter = total_num_occupied_blocks;
+
+
+  //slot 6
+  num_extracted_meshlets_task_mesh_shader_index_offset = 0;
+
+  uint32_t total_num_groups_of_extracted_meshlets = snapdiv(num_extracted_meshlets_task_mesh_shader_counter, 32);
+
+
+
+  //slot 900 - 904: single indexed array indirect draw parameters
+  single_indexed_array_indirect_draw_count = num_extracted_indices_atomic_counter * 3;
+  single_indexed_array_indirect_instance_count = 1;
+  single_indexed_array_indirect_first_index = 0;
+  single_indexed_array_base_vertex = 0;
+  single_indexed_array_base_instance = 0;
+
+
+  //slots 1000 - 1002
+  extracted_meshlet_counter_dispatch_x = num_extracted_meshlets_task_mesh_shader_counter;
+  extracted_meshlet_counter_dispatch_y = 1;
+  extracted_meshlet_counter_dispatch_z = 1;
+
+  //slots 1003 - 1005
+  group_of_extracted_meshlet_counter_dispatch_x = total_num_groups_of_extracted_meshlets;
+  group_of_extracted_meshlet_counter_dispatch_y = 1;
+  group_of_extracted_meshlet_counter_dispatch_z = 1;
+
+  //slot 1018
+  group_of_extracted_meshlets_counter = total_num_groups_of_extracted_meshlets;
+  //slot 1019
+  group_of_extracted_meshlets_index_offset = 0;
+
+  //slot 1020
+  occupied_blocks_counter = total_num_occupied_blocks;
+  //slot 1021
+  occupied_blocks_index_offset = 0;
+
+  //slot 1022
+  group_of_occupied_blocks_counter = total_num_groups_of_occupied_blocks;
+  //slot 1023
+  group_of_occupied_blocks_index_offset = 0;
+
+
+}

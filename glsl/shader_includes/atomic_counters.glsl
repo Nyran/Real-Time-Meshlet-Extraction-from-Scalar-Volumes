@@ -1,0 +1,42 @@
+layout(std430, binding = 3) coherent buffer  joint_atomic_counters_ssbo {
+    uint32_t joint_atomic_counters[];
+};
+
+#include "atomic_counter_buffer_config.h.glsl"
+
+#define persistent_extraction_num_occupied_blocks_atomic_counter (joint_atomic_counters[NUM_OCCUPIED_BLOCKS_ATOMIC_COUNTER_SSBO_UINT32_OFFSET])
+#define indirect_dispatch_dim_y (joint_atomic_counters[NUM_OCCUPIED_BLOCKS_ATOMIC_COUNTER_SSBO_UINT32_OFFSET + 1])
+#define indirect_dispatch_dim_z (joint_atomic_counters[NUM_OCCUPIED_BLOCKS_ATOMIC_COUNTER_SSBO_UINT32_OFFSET + 2])
+
+#define num_extracted_meshlets_task_mesh_shader_counter (joint_atomic_counters[NUM_EXTRACTED_MESHLETS_TASK_MESH_SHADER_COUNTER_SSBO_UINT32_OFFSET])
+#define num_extracted_meshlets_task_mesh_shader_index_offset (joint_atomic_counters[INDEX_OFFSET_INTO_EXTRACTED_MESHLETS_TASK_MESH_SHADER_SSBO_UINT32_OFFSET])
+
+#define num_extracted_vertices_atomic_counter (joint_atomic_counters[NUM_EXTRACTED_VERTICES_ATOMIC_COUNTER_SSBO_UINT32_OFFSET])
+#define num_extracted_indices_atomic_counter (joint_atomic_counters[NUM_EXTRACTED_INDICES_ATOMIC_COUNTER_SSBO_UINT32_OFFSET])
+
+#define region_size_histogram_counters(region_bin_idx) (joint_atomic_counters[9 + region_bin_idx])
+#define vertex_per_meshlet_histogram_counters(vertex_bin_idx) (joint_atomic_counters[12 + vertex_bin_idx])
+#define triangle_per_meshlet_histogram_counters(triangle_bin_idx) (joint_atomic_counters[140 + triangle_bin_idx])
+
+#define single_indexed_array_indirect_draw_count (joint_atomic_counters[SINGLE_INDEXED_ARRAY_INDIRECT_DRAW_COMMAND_SSBO_UINT32_OFFSET])
+#define single_indexed_array_indirect_instance_count (joint_atomic_counters[SINGLE_INDEXED_ARRAY_INDIRECT_DRAW_COMMAND_SSBO_UINT32_OFFSET + 1])
+#define single_indexed_array_indirect_first_index (joint_atomic_counters[SINGLE_INDEXED_ARRAY_INDIRECT_DRAW_COMMAND_SSBO_UINT32_OFFSET + 2])
+#define single_indexed_array_base_vertex (joint_atomic_counters[SINGLE_INDEXED_ARRAY_INDIRECT_DRAW_COMMAND_SSBO_UINT32_OFFSET + 3])
+#define single_indexed_array_base_instance (joint_atomic_counters[SINGLE_INDEXED_ARRAY_INDIRECT_DRAW_COMMAND_SSBO_UINT32_OFFSET + 4])
+
+#define extracted_meshlet_counter_dispatch_x (joint_atomic_counters[MESHLET_EXTRACTION_EXT_DISPATCH_CONFIG_SSBO_UINT32_OFFSET])
+#define extracted_meshlet_counter_dispatch_y (joint_atomic_counters[MESHLET_EXTRACTION_EXT_DISPATCH_CONFIG_SSBO_UINT32_OFFSET + 1])
+#define extracted_meshlet_counter_dispatch_z (joint_atomic_counters[MESHLET_EXTRACTION_EXT_DISPATCH_CONFIG_SSBO_UINT32_OFFSET + 2])
+
+#define group_of_extracted_meshlet_counter_dispatch_x (joint_atomic_counters[1003])
+#define group_of_extracted_meshlet_counter_dispatch_y (joint_atomic_counters[1004])
+#define group_of_extracted_meshlet_counter_dispatch_z (joint_atomic_counters[1005])
+
+#define group_of_extracted_meshlets_counter (joint_atomic_counters[1018])
+#define group_of_extracted_meshlets_index_offset (joint_atomic_counters[1019])
+
+#define occupied_blocks_counter (joint_atomic_counters[NUMBER_OF_OCCUPIED_BLOCKS_SSBO_UINT32_OFFSET])
+#define occupied_blocks_index_offset (joint_atomic_counters[INDEX_OFFSET_INTO_OCCUPIED_BLOCKS_SSBO_UINT32_OFFSET])
+
+#define group_of_occupied_blocks_counter (joint_atomic_counters[NUMBER_OF_OCCUPIED_BLOCK_GROUPS_COUNTER_SSBO_UINT32_OFFSET])
+#define group_of_occupied_blocks_index_offset (joint_atomic_counters[INDEX_OFFSET_INTO_OCCUPIED_BLOCK_GROUPS_SSBO_UINT32_OFFSET])

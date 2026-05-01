@@ -1,0 +1,390 @@
+#version 460 core
+
+#ifndef MAX_OCCUPIED_CELLS_MESH_SHADER_PMB
+#define MAX_OCCUPIED_CELLS_MESH_SHADER_PMB 96
+#endif //MAX_OCCUPIED_CELLS_MESH_SHADER_PMB
+
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+#extension GL_EXT_mesh_shader : require
+#else
+#extension GL_NV_mesh_shader : require
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_ARB_shading_language_include : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_vote : require
+
+//since we use the GL_NV_mesh_shader extension which is limited to 32 threads for now, we have to split PMB into several iterations
+const uint32_t MAX_NUM_ITERATIONS_FOR_A_THREAD = (MAX_OCCUPIED_CELLS_MESH_SHADER_PMB + 32 - 1) / 32;
+
+#include "../shader_includes/defines.glsl"
+
+//dummy
+#define MAX_VERTS 1
+#define MAX_TRIS 1
+layout(max_vertices=MAX_VERTS, max_primitives=MAX_TRIS) out;
+// use 8 bit indices within a meshlet to reference the vertices
+#define SHADER_VARIANT_LOCAL_8_BIT_INDICES
+#include "../shader_includes/abstract_mesh_shader_submission_interface.glsl"
+
+#include "../shader_includes/atomic_counters.glsl"
+#include "../shader_includes/volumes.glsl"
+#include "../shader_includes/marching_cubes_tables.glsl"
+#include "../shader_includes/math.glsl"
+#include "../shader_includes/ssbos.glsl"
+
+const int32_t SUBGROUP_SIZE = DEVICE_DEPENDENT_SUBGROUP_SIZE;
+const int32_t WORKGROUP_SIZE = 32;
+layout(local_size_x=WORKGROUP_SIZE) in;
+
+//use dummy layout, since we do not actually intend to rasterize any geometry, but extract into SSBOs
+layout(points) out;
+
+/*
+  Meshlet Extraction Mesh Shader (paper Sec. 3.2.2, supplementary Listing 2)
+  ==========================================================================
+
+  ROLE. One mesh-shader workgroup (32 threads) extracts exactly one meshlet
+  from a single subblock that the region analysis task shader has selected
+  for it. The workgroup writes vertex positions, vertex normals, triangle
+  indices and a meshlet descriptor into the global persistent SSBOs.
+
+  INPUT (via the task->mesh payload, see extraction_task_mesh_shader_interface.glsl).
+    - IN.baseID: 1D index of the parent 8x8x4 block.
+    - IN.dense_occupied_333_or_555_block_indices_and_size_mode[gl_WorkGroupID.x]:
+      packed (subblock_z_order_id, size_mode) for THIS meshlet.
+    - IN.occupied_cells_less_than_995[...]: list of cell indices to process for
+      LARGEST_REGION / MEDIUM_SIZED_REGION meshlets (SMALLEST_REGION enumerates
+      its 8 cells directly).
+    - IN.global_extraction_*_offset and IN.local_vertex_and_triangle_offset_per_meshlet:
+      where in the global SSBOs to write.
+
+  ALGORITHM (Parallel Marching Blocks per cell).
+    1. Decode subblock origin from gl_WorkGroupID.x. Recover this meshlet's
+       active-cell count from the prefix-sum payload entries.
+    2. PMB iteration: each thread processes (num_active_cells / 32) cells
+       across MAX_NUM_ITERATIONS_FOR_A_THREAD passes. For each cell:
+         a. Sample the eight corner values, compute the marching-cubes case.
+         b. Identify the (up to 3) unique edges this cell owns (PMB
+            convention) within the unpadded subblock and write the resulting
+            vertex positions and normals to the global vertex/normal SSBOs.
+         c. Stash a per-cell bitmask in shared `vertex_index_bitmasks`
+            recording the local vertex offset and which of the 3 unique
+            edges produced a vertex (used for index resolution below).
+    3. After all threads finish vertex extraction, a second pass walks the
+       per-cell triangle table and resolves each triangle's three indices by
+       reading `vertex_index_bitmasks` at the neighboring cells (PMB index
+       reconstruction). Indices are written as 8-bit local-meshlet indices.
+    4. The last thread writes the meshlet descriptor (vertex/index offsets
+       and counts) and, if vertex-histogram instrumentation is enabled,
+       accumulates per-meshlet statistics.
+
+  OUTPUT. Persistent meshlet geometry in the global SSBOs declared in
+  ssbos.glsl, ready to be consumed by the forward-rendering meshlet shaders
+  in glsl/forward_rendering/triangle_mode/.
+*/
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+struct task_to_mesh_shader_extraction_payload {
+    #include "extraction_task_mesh_shader_interface.glsl"
+};
+taskPayloadSharedEXT task_to_mesh_shader_extraction_payload IN;
+#else //USES_NV_MESH_SHADER_EXTENSION
+taskNV in Task {
+    #include "extraction_task_mesh_shader_interface.glsl"
+} IN;
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+
+
+shared uint16_t vertex_index_bitmasks[PADDED_BLOCK_SIZE_Z][PADDED_BLOCK_SIZE_Y][PADDED_BLOCK_SIZE_X];
+
+
+void main() {
+    if(0 == gl_LocalInvocationIndex) {
+        write_num_primitives_extension_independent(0, 0);
+    }
+
+    const float current_iso_value = extraction_parameters_UBO.iso_value;
+
+    const ivec3 num_blocks_in_volume_3d = volTexSize / ivec3(UNPADDED_BLOCK_SIZE_X, UNPADDED_BLOCK_SIZE_Y, UNPADDED_BLOCK_SIZE_Z);
+
+    int32_t passed_occupied_block_index = int32_t(IN.baseID);
+
+    ivec3 unflattened_occupied_block_index;
+    unflattened_occupied_block_index.z = passed_occupied_block_index / (num_blocks_in_volume_3d.x * num_blocks_in_volume_3d.y);
+    passed_occupied_block_index -= (unflattened_occupied_block_index.z * num_blocks_in_volume_3d.x * num_blocks_in_volume_3d.y);
+    unflattened_occupied_block_index.y = passed_occupied_block_index / num_blocks_in_volume_3d.x;
+    unflattened_occupied_block_index.x = passed_occupied_block_index % num_blocks_in_volume_3d.x;
+
+    const ivec3 block_sampling_offset = unflattened_occupied_block_index * ivec3(UNPADDED_BLOCK_SIZE_X, UNPADDED_BLOCK_SIZE_Y, UNPADDED_BLOCK_SIZE_Z);
+
+    float sampled_values[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    ivec3 cell_sampling_index = ivec3(0);
+
+    const uint32_t encoded_area_size_and_block_size_mode = IN.dense_occupied_333_or_555_block_indices_and_size_mode[gl_WorkGroupID.x];
+    const uint32_t encoded_area_size = encoded_area_size_and_block_size_mode >> 6;
+    int32_t num_active_cells_in_area = 26;
+
+    ivec3 subblock_sampling_offset = {0, 0, 0};
+    if(encoded_area_size != LARGEST_REGION) { // is not largest region -> compute subblock offset
+        const uint z_order_occupied_subblock_id = encoded_area_size_and_block_size_mode & 0x3F;
+        subblock_sampling_offset = 2 * one_d_to_morton_442(z_order_occupied_subblock_id);
+    }
+
+    int32_t num_active_cells_in_area_exclusive_prefix_sum = 0;
+    if(SMALLEST_REGION != encoded_area_size) {
+        int32_t num_active_cells_in_area_inclusive_prefix_sum = int(IN.num_active_cells_in_555_or_995_area_inclusive_prefix_sum[gl_WorkGroupID.x]);
+        if(0 != gl_WorkGroupID.x) {
+            num_active_cells_in_area_exclusive_prefix_sum = int(IN.num_active_cells_in_555_or_995_area_inclusive_prefix_sum[gl_WorkGroupID.x - 1]);
+        }
+        num_active_cells_in_area = num_active_cells_in_area_inclusive_prefix_sum - num_active_cells_in_area_exclusive_prefix_sum;
+    }
+
+    const ivec3 subblock_size_dependent_dims = SUBBLOCK_SIZE_DIMS[encoded_area_size].xyz;
+
+    uint32_t inter_iteration_vertex_write_offset = 0;
+
+    #if (1 == MAX_NUM_ITERATIONS_FOR_A_THREAD)
+    uint32_t num_triangles_to_extract_per_cell[1] = {uint32_t(0)};
+    uint32_t cube_case_per_cell[1] = {uint32_t(0)};
+    int16_t encoded_3d_cell_sampling_indices[1] = {int16_t(0)};
+    #elif (2 == MAX_NUM_ITERATIONS_FOR_A_THREAD)
+    uint32_t num_triangles_to_extract_per_cell[2] = {uint32_t(0), uint32_t(0)};
+    uint32_t cube_case_per_cell[2] = {uint32_t(0), uint32_t(0)};
+    int16_t encoded_3d_cell_sampling_indices[2] = {int16_t(0), int16_t(0)};
+    #elif (3 == MAX_NUM_ITERATIONS_FOR_A_THREAD)
+    uint32_t num_triangles_to_extract_per_cell[3] = {uint32_t(0), uint32_t(0), uint32_t(0)};
+    uint32_t cube_case_per_cell[3] = {uint32_t(0), uint32_t(0), uint32_t(0)};
+    int16_t encoded_3d_cell_sampling_indices[3] = {int16_t(0), int16_t(0), int16_t(0)};
+    #else // (4 == MAX_NUM_ITERATIONS_FOR_A_THREAD)
+    uint32_t num_triangles_to_extract_per_cell[4] = {uint32_t(0), uint32_t(0), uint32_t(0), uint32_t(0)};
+    uint32_t cube_case_per_cell[4] = {uint32_t(0), uint32_t(0), uint32_t(0), uint32_t(0)};
+    int16_t encoded_3d_cell_sampling_indices[4] = {int16_t(0), int16_t(0), int16_t(0), int16_t(0)};
+    #endif
+
+    uint32_t total_num_written_vertices = 0;
+
+    #pragma unroll
+    for(uint32_t iteration_index = 0; iteration_index < MAX_NUM_ITERATIONS_FOR_A_THREAD; ++iteration_index) {
+        ivec3 unflattened_local_cell_sampling_index = ivec3(0, 0, 0);
+        uint32_t cell_handling_index = gl_LocalInvocationIndex + iteration_index * gl_WorkGroupSize.x;
+        bool is_thread_active = (cell_handling_index < num_active_cells_in_area);
+
+        ivec4 distinct_edges = ivec4(0, 0, 0, 0);
+
+        //resolve region size and occupied cells for each thread of the workgroup
+        if(is_thread_active) {
+            int32_t reconstructed_cell_index = 0;
+            uint32_t cube_case = 0x0;
+            if(LARGEST_REGION == encoded_area_size) {
+                uint32_t lookup_index = cell_handling_index * 2;
+                reconstructed_cell_index = (int(IN.occupied_cells_less_than_995[lookup_index])) | (int(IN.occupied_cells_less_than_995[lookup_index + 1]) << 8);
+            } else if(MEDIUM_SIZED_REGION == encoded_area_size) {
+                reconstructed_cell_index = int(IN.occupied_cells_less_than_995[num_active_cells_in_area_exclusive_prefix_sum + cell_handling_index]);
+            } else { //for our fallback size, we let all threads just check all cells either way, because that saved us allocating a large amount of task interface memory for resolving tiny regions
+                reconstructed_cell_index = int(cell_handling_index);
+            }
+
+            unflattened_local_cell_sampling_index = unflatten_one_d_index(reconstructed_cell_index, subblock_size_dependent_dims.xy);
+
+            //compute the position of the occupied cell for each thread in our 8x8x4 macro block
+            cell_sampling_index = block_sampling_offset + subblock_sampling_offset + unflattened_local_cell_sampling_index;
+
+            encoded_3d_cell_sampling_indices[iteration_index]
+                = int16_t(
+                    (unflattened_local_cell_sampling_index.x) |
+                    ((unflattened_local_cell_sampling_index.y << 5)) |
+                    ((unflattened_local_cell_sampling_index.z << 10))
+                );
+
+            sampled_values[0] = sample_volume(cell_sampling_index);
+            sampled_values[1] = sample_volume(cell_sampling_index + zero_one.yxx); // ivec3(1, 0, 0)
+            sampled_values[2] = sample_volume(cell_sampling_index + zero_one.yyx); // ivec3(1, 1, 0)
+            sampled_values[3] = sample_volume(cell_sampling_index + zero_one.xyx); // ivec3(0, 1, 0)
+            sampled_values[4] = sample_volume(cell_sampling_index + zero_one.xxy); // ivec3(0, 0, 1)
+            sampled_values[5] = sample_volume(cell_sampling_index + zero_one.yxy); // ivec3(1, 0, 1)
+            sampled_values[6] = sample_volume(cell_sampling_index + zero_one.yyy); // ivec3(1, 1, 1)
+            sampled_values[7] = sample_volume(cell_sampling_index + zero_one.xyy); // ivec3(0, 1, 1)
+
+            /* Note that for computing the normal cones we would need to add a marching cubes pass inside the Parallel Marching blocks extraction kernel to be able to create
+               per face normals. This is inefficient, though, and we do not recommend using normal cones with our approach for now (see also the explanations in the paper) */
+
+            #pragma unroll
+            for(uint32_t cube_corner_idx = 0u; cube_corner_idx < 8u; ++cube_corner_idx) {
+                cube_case += (uint32_t(sampled_values[cube_corner_idx] < current_iso_value) << cube_corner_idx);
+            }
+
+            bool nonTrivial = (cube_case - 1u) < 254u;
+
+            if(nonTrivial) {
+                cube_case_per_cell[iteration_index] = uint32_t(cube_case);
+                uint32_t intersected_edges = (texelFetch(edge_table, int32_t(cube_case)).x);
+
+                ivec3 padding_modulus = ivec3(2, 2, 2);
+                if(LARGEST_REGION == encoded_area_size) {
+                    padding_modulus = ivec3(8, 8, 4);
+                } else if(MEDIUM_SIZED_REGION == encoded_area_size) {
+                    padding_modulus = ivec3(4, 4, 4);
+                }
+
+                distinct_edges = ivec4(
+                    ((0x0 != (intersected_edges & 0x1  ) && (unflattened_local_cell_sampling_index.x < padding_modulus.x)) ? 1 : 0),
+                    ((0x0 != (intersected_edges & 0x8  ) && (unflattened_local_cell_sampling_index.y < padding_modulus.y)) ? 1 : 0),
+                    ((0x0 != (intersected_edges & 0x100) && (unflattened_local_cell_sampling_index.z < padding_modulus.z)) ? 1 : 0),
+                    0);
+
+                distinct_edges.w = int(dot(vec3(distinct_edges.xyz), vec3(1, 1, 1)));
+
+                if(all(lessThan(unflattened_local_cell_sampling_index, padding_modulus))) {
+                    num_triangles_to_extract_per_cell[iteration_index] = texelFetch(total_num_triangles_per_cell_tri_table, int(cube_case)).x;
+                }
+            }
+        }
+
+        uint32_t own_exclusive_vertex_count = inter_iteration_vertex_write_offset + subgroupExclusiveAdd(distinct_edges.w);
+        uint32_t own_inclusive_vertex_count = own_exclusive_vertex_count + distinct_edges.w;
+        total_num_written_vertices = own_inclusive_vertex_count;
+
+        //broadcast vertex offset of last thread
+        if((iteration_index + 1) != MAX_NUM_ITERATIONS_FOR_A_THREAD) {
+            inter_iteration_vertex_write_offset = subgroupBroadcast(own_inclusive_vertex_count, gl_WorkGroupSize.x - 1);
+        }
+
+        if(is_thread_active) {
+            uint32_t num_vertices_written = 0;
+            uint32_t bitmask = 0x0;
+
+            if(distinct_edges.w > 0) {
+                vec3 vertex_position = (cell_sampling_index) * extraction_parameters_UBO.voxel_size.xyz;
+
+                uint32_t occupied_vertex_indices[3] = {0u, 0u, 0u};
+                uint32_t occupied_index_write_index = 0;
+                #pragma unroll
+                for(uint32_t potentially_occupied_edge_idx = 0; potentially_occupied_edge_idx < 3; ++potentially_occupied_edge_idx) {
+                    if(1 == distinct_edges[potentially_occupied_edge_idx]) {
+                        occupied_vertex_indices[occupied_index_write_index] = potentially_occupied_edge_idx;
+                        ++occupied_index_write_index;
+                    }
+                }
+
+                mat3x3 vertices_to_sample
+                    = {
+                        vertex_interp(current_iso_value, vertex_position, vertex_position + extraction_parameters_UBO.voxel_size.xww, sampled_values[0], sampled_values[1]),
+                        vertex_interp(current_iso_value, vertex_position + extraction_parameters_UBO.voxel_size.wyw, vertex_position, sampled_values[3], sampled_values[0]),
+                        vertex_interp(current_iso_value, vertex_position, vertex_position + extraction_parameters_UBO.voxel_size.wwz, sampled_values[0], sampled_values[4])
+                    };
+
+                for(uint32_t occupied_edge_idx = 0; occupied_edge_idx < distinct_edges.w; ++occupied_edge_idx) {
+                    const uint32_t CURRENT_WRITE_INDEX = occupied_vertex_indices[occupied_edge_idx];
+                    //write out vertex positions persistently based on precomputed offsets
+                    uint32_t vertex_write_offset = IN.global_extraction_vertex_offset + (IN.local_vertex_and_triangle_offset_per_meshlet[gl_WorkGroupID.x] >> 16) + own_exclusive_vertex_count + num_vertices_written;
+
+                    //needs to extract vertex positions either way, because we do not model a producer-consumer pattern if we use a separate compute shader
+                    vec3 vertex_position_to_write = vertices_to_sample[CURRENT_WRITE_INDEX];
+
+                    write_extracted_vertex_position(vertex_write_offset, vertex_position_to_write);
+                    write_extracted_vertex_normals(vertex_write_offset, normalize(sample_gradient(vertex_position_to_write.xyz)));
+
+                    ++num_vertices_written;
+                }
+
+                const uint bitmask_pre_shift = distinct_edges.x * 4 + distinct_edges.y * 2 + distinct_edges.z;
+                bitmask = (bitmask_pre_shift << 13) | own_exclusive_vertex_count;
+
+                vertex_index_bitmasks[unflattened_local_cell_sampling_index.z][unflattened_local_cell_sampling_index.y][unflattened_local_cell_sampling_index.x] = uint16_t(bitmask);
+            }
+        }
+    }
+
+    uint32_t total_num_written_triangles = 0;
+
+    for (int iteration_idx = 0; iteration_idx < MAX_NUM_ITERATIONS_FOR_A_THREAD; ++iteration_idx) {
+        total_num_written_triangles += num_triangles_to_extract_per_cell[iteration_idx];
+    }
+
+    total_num_written_triangles = subgroupClusteredAdd(total_num_written_triangles, SUBGROUP_SIZE);
+
+    uint32_t num_triangle_indices_encoded_in_last_iteration = 0;
+    uint32_t own_triangle_count = 0;
+
+    #pragma unroll
+    for(uint32_t iteration_index = 0; iteration_index < MAX_NUM_ITERATIONS_FOR_A_THREAD; ++iteration_index) {
+        const int32_t current_encoded_cell_sampling_indices = int32_t(encoded_3d_cell_sampling_indices[iteration_index]);
+
+        ivec3 current_unflattened_local_cell_sampling_index
+            = ivec3(current_encoded_cell_sampling_indices & 0x1F,
+                    (current_encoded_cell_sampling_indices >> 5) & 0x1F,
+                    (current_encoded_cell_sampling_indices >> 10) & 0x1F);
+
+        uint32_t per_subgroup_triangle_base_write_offset = num_triangle_indices_encoded_in_last_iteration + subgroupExclusiveAdd(num_triangles_to_extract_per_cell[iteration_index]);
+        own_triangle_count = per_subgroup_triangle_base_write_offset + num_triangles_to_extract_per_cell[iteration_index];
+
+        if(iteration_index + 1 != MAX_NUM_ITERATIONS_FOR_A_THREAD) {
+            num_triangle_indices_encoded_in_last_iteration = subgroupBroadcast(own_triangle_count, SUBGROUP_SIZE - 1);
+        }
+
+        uint32_t vertex_table_cube_base_offset = cube_case_per_cell[iteration_index] * 5;
+
+        for(uint triangle_to_write_index = 0; triangle_to_write_index < num_triangles_to_extract_per_cell[iteration_index]; ++triangle_to_write_index) {
+            const uint32_t per_thread_index_base_offset =
+                ( (IN.local_vertex_and_triangle_offset_per_meshlet[gl_WorkGroupID.x] & 0xFFFF) + IN.global_extraction_triangle_offset
+                  + per_subgroup_triangle_base_write_offset
+                  + triangle_to_write_index) * 3;
+
+            uint32_t edge_table_base_offset = vertex_table_cube_base_offset + triangle_to_write_index;
+            uint32_t edge_indices_combined = texelFetch(packed_16_bit_vertices_tri_table, int(edge_table_base_offset)).x;
+            uint32_t edge_indices_unpacked[3] = {edge_indices_combined & 0xF, (edge_indices_combined >> 4) & 0xF, edge_indices_combined >> 8};
+
+            #pragma unroll
+            for(uint local_vertex_indirection_index = 0; local_vertex_indirection_index < 3; ++local_vertex_indirection_index) {
+                uint32_t edge_idx = edge_indices_unpacked[local_vertex_indirection_index];
+
+                const uint32_t edgemap = neighbor_mapping_table_const_memory[edge_idx];
+
+                uvec3 vertex_index_bitmask_key = current_unflattened_local_cell_sampling_index + ((ivec3(edgemap) >> ivec3(4,3,2)) & 0x1);
+
+                uint32_t bitmask
+                    = vertex_index_bitmasks
+                    [vertex_index_bitmask_key.z]
+                    [vertex_index_bitmask_key.y]
+                    [vertex_index_bitmask_key.x];
+
+                uint intra_block_offset = bitmask & 0x1fff;
+                uvec3 distinct_neighbor_edge_occupancy = (ivec3(bitmask) >> ivec3(15, 14, 13)) & 0x1;
+
+                uint edgeSum = 0;
+                const uint32_t num_distinct_neighbor_vertices = edgemap & 0x3;
+                for(int ii = 0; ii < num_distinct_neighbor_vertices; ++ii) {
+                    edgeSum += distinct_neighbor_edge_occupancy[ii];
+                }
+
+                uint32_t per_meshlet_index_write_offset = per_thread_index_base_offset + local_vertex_indirection_index;
+                extracted_triangle_indices[per_meshlet_index_write_offset] = uint8_t(edgeSum + intra_block_offset);
+            }
+        }
+    }
+
+
+    if(gl_WorkGroupSize.x == (gl_LocalInvocationIndex + 1)) {
+        const uint32_t vertex_offset = (IN.global_extraction_vertex_offset + (IN.local_vertex_and_triangle_offset_per_meshlet[gl_WorkGroupID.x] >> 16));
+        const uint32_t triangle_index_offset = (IN.global_extraction_triangle_offset + (IN.local_vertex_and_triangle_offset_per_meshlet[gl_WorkGroupID.x] & 0xFFFF)) * 3;
+
+        meshlet_geometry_info_t meshlet_geometry_info_to_write = {
+            vertex_offset, triangle_index_offset,
+            total_num_written_vertices,
+            total_num_written_triangles
+        };
+
+        //for meshlet vertex histogram analysis only
+        #ifdef PASS_EXTRACTION_REGION_SIZE_COLOR
+        atomicAdd(vertex_per_meshlet_histogram_counters(total_num_written_vertices-1), 1);
+        atomicAdd(triangle_per_meshlet_histogram_counters(total_num_written_triangles-1), 1);
+        #endif //PASS_EXTRACTION_REGION_SIZE_COLOR
+
+        uint32_t meshlet_descriptor_write_offset = IN.atomic_meshlet_descriptor_write_offset + gl_WorkGroupID.x;
+        meshlet_geometry_info[meshlet_descriptor_write_offset] = meshlet_geometry_info_to_write;
+    }
+}

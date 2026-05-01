@@ -1,0 +1,444 @@
+#version 460 core
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+#extension GL_NV_gpu_shader5 : require
+
+#include "../shader_includes/ssbos.glsl"
+
+#include "../shader_includes/volumes.glsl"
+#include "../shader_includes/marching_cubes_tables.glsl"
+#include "../shader_includes/math.glsl"
+#include "../shader_includes/atomic_counters.glsl"
+#include "../shader_includes/per_frame_indirect_draw_parameter_ssbo.glsl"
+
+
+layout(local_size_x = PADDED_WG_SIZE_X, local_size_y = PADDED_WG_SIZE_Y, local_size_z = PADDED_WG_SIZE_Z) in;
+
+
+const uint32_t TOTAL_NUM_ACTIVE_THREADS = PADDED_WG_SIZE_X*PADDED_WG_SIZE_Y*PADDED_WG_SIZE_Z;
+const uint32_t NUM_ACTIVE_WARPS_IN_WORK_GROUP = ( (TOTAL_NUM_ACTIVE_THREADS + 31) / 32);
+
+
+
+shared uint shared_warp_vertex_results[NUM_ACTIVE_WARPS_IN_WORK_GROUP + 1];
+
+shared uint16_t vertex_index_bitmasks[PADDED_WG_SIZE_Z][PADDED_WG_SIZE_Y][PADDED_WG_SIZE_X];
+
+
+void main() {
+    const uint32_t warp_idx = gl_LocalInvocationIndex >> 5; // / 32
+    const uint32_t lane_idx = gl_LocalInvocationIndex & 0x1F; // mod 32
+    const uint32_t thread_remainder = clamp(TOTAL_NUM_ACTIVE_THREADS - warp_idx * 32, uint32_t(0), uint32_t(32));
+    const uint32_t last_thread_in_warp = thread_remainder - 1;
+
+
+   int32_t flattened_work_group_index = int32_t(gl_WorkGroupID.x);
+   int32_t flat_occupied_block_index = int32_t(dense_occupied_block_indices[flattened_work_group_index]);
+   
+   ivec3 bricks_in_volume_3d = volTexSize / ivec3(UNPADDED_WG_SIZE_X, UNPADDED_WG_SIZE_Y, UNPADDED_WG_SIZE_Z);
+
+   ivec3 unflattened_occupied_block_index;
+   unflattened_occupied_block_index.z = flat_occupied_block_index / (bricks_in_volume_3d.x * bricks_in_volume_3d.y);
+   flat_occupied_block_index -= (unflattened_occupied_block_index.z * bricks_in_volume_3d.x * bricks_in_volume_3d.y);
+   unflattened_occupied_block_index.y = flat_occupied_block_index / bricks_in_volume_3d.x;
+   unflattened_occupied_block_index.x = flat_occupied_block_index % bricks_in_volume_3d.x;
+
+
+   ivec3 brick_offset_in_voxels = unflattened_occupied_block_index * ivec3(UNPADDED_BLOCK_SIZE_X, UNPADDED_BLOCK_SIZE_Y, UNPADDED_BLOCK_SIZE_Z);
+
+
+    //work on core cells
+    ivec3 unflattened_local_cell_sampling_index = ivec3(index_to_xyz_padded(gl_LocalInvocationIndex, UNPADDED_BLOCK_SIZE_X, UNPADDED_BLOCK_SIZE_Y, UNPADDED_BLOCK_SIZE_Z));//ivec3(gl_LocalInvocationID.xyz);
+   
+    float sampled_values[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const bool is_core_cell = gl_LocalInvocationIndex < NUM_UNPADDED_VOXELS_PER_BLOCK;
+    
+    float current_iso_value = extraction_parameters_UBO.iso_value;
+    uint32_t cube_case = 0x0;
+
+    ivec3 cell_sampling_index = brick_offset_in_voxels + unflattened_local_cell_sampling_index;
+
+    // Padding cells on the +x/+y/+z faces of a block only contribute the corners that
+    // span an edge into the *neighbouring* block, so we sample and bit-pack only those.
+    if (is_core_cell) {
+        sampled_values[0] = sample_volume(cell_sampling_index);
+        sampled_values[1] = sample_volume(cell_sampling_index + zero_one.yxx); // (1, 0, 0)
+        sampled_values[2] = sample_volume(cell_sampling_index + zero_one.yyx); // (1, 1, 0)
+        sampled_values[3] = sample_volume(cell_sampling_index + zero_one.xyx); // (0, 1, 0)
+        sampled_values[4] = sample_volume(cell_sampling_index + zero_one.xxy); // (0, 0, 1)
+        sampled_values[5] = sample_volume(cell_sampling_index + zero_one.yxy); // (1, 0, 1)
+        sampled_values[6] = sample_volume(cell_sampling_index + zero_one.yyy); // (1, 1, 1)
+        sampled_values[7] = sample_volume(cell_sampling_index + zero_one.xyy); // (0, 1, 1)
+        #pragma unroll
+        for (uint32_t cube_corner_idx = 0u; cube_corner_idx < 8u; ++cube_corner_idx) {
+            cube_case += (uint32_t(sampled_values[cube_corner_idx] < current_iso_value) << cube_corner_idx);
+        }
+    } else {
+        const bool is_padding_slice_yz_cell = (gl_LocalInvocationIndex - NUM_UNPADDED_VOXELS_PER_BLOCK) < (NUM_UNPADDED_VOXELS_PER_YZ_SLICE);
+
+        if (is_padding_slice_yz_cell) {
+            // YZ padding face: only corners 0, 3, 4 cross into the neighbour
+            sampled_values[0] = sample_volume(cell_sampling_index);
+            sampled_values[3] = sample_volume(cell_sampling_index + zero_one.xyx);
+            sampled_values[4] = sample_volume(cell_sampling_index + zero_one.xxy);
+
+            cube_case += (uint32_t(sampled_values[0] < current_iso_value));
+            cube_case += (uint32_t(sampled_values[3] < current_iso_value) << 3);
+            cube_case += (uint32_t(sampled_values[4] < current_iso_value) << 4);
+        } else {
+            const bool is_padding_slice_xz_cell = (gl_LocalInvocationIndex - (NUM_UNPADDED_VOXELS_PER_BLOCK + NUM_UNPADDED_VOXELS_PER_YZ_SLICE)) < NUM_UNPADDED_VOXELS_PER_XZ_SLICE;
+
+            if (is_padding_slice_xz_cell) {
+                // XZ padding face: only corners 0, 1, 4 cross into the neighbour
+                sampled_values[0] = sample_volume(cell_sampling_index);
+                sampled_values[1] = sample_volume(cell_sampling_index + zero_one.yxx);
+                sampled_values[4] = sample_volume(cell_sampling_index + zero_one.xxy);
+
+                cube_case += (uint32_t(sampled_values[0] < current_iso_value));
+                cube_case += (uint32_t(sampled_values[1] < current_iso_value) << 1);
+                cube_case += (uint32_t(sampled_values[4] < current_iso_value) << 4);
+            } else {
+                const bool is_padding_slice_xy_cell = (gl_LocalInvocationIndex - (NUM_UNPADDED_VOXELS_PER_BLOCK + NUM_UNPADDED_VOXELS_PER_YZ_SLICE + NUM_UNPADDED_VOXELS_PER_XZ_SLICE)) < NUM_UNPADDED_VOXELS_PER_XY_SLICE;
+
+                if (is_padding_slice_xy_cell) {
+                    // XY padding face: only corners 0, 1, 3 cross into the neighbour
+                    sampled_values[0] = sample_volume(cell_sampling_index);
+                    sampled_values[1] = sample_volume(cell_sampling_index + zero_one.yxx);
+                    sampled_values[3] = sample_volume(cell_sampling_index + zero_one.xyx);
+
+                    cube_case += (uint32_t(sampled_values[0] < current_iso_value));
+                    cube_case += (uint32_t(sampled_values[1] < current_iso_value) << 1);
+                    cube_case += (uint32_t(sampled_values[3] < current_iso_value) << 3);
+                } else {
+                    // Leftover padding edge column: corners 0, 1, 3, 4 cross
+                    sampled_values[0] = sample_volume(cell_sampling_index);
+                    sampled_values[1] = sample_volume(cell_sampling_index + zero_one.yxx);
+                    sampled_values[3] = sample_volume(cell_sampling_index + zero_one.xyx);
+                    sampled_values[4] = sample_volume(cell_sampling_index + zero_one.xxy);
+
+                    cube_case += (uint32_t(sampled_values[0] < current_iso_value));
+                    cube_case += (uint32_t(sampled_values[1] < current_iso_value) << 1);
+                    cube_case += (uint32_t(sampled_values[3] < current_iso_value) << 3);
+                    cube_case += (uint32_t(sampled_values[4] < current_iso_value) << 4);
+                }
+            }
+        }
+    }
+
+
+    ivec4 distinct_edges = ivec4(0);
+
+    uint32_t num_triangles_to_extract = 0;
+
+    if( (0 != (cube_case % 255) ) ) {
+        uint32_t intersected_edges = (texelFetch(edge_table, int32_t(cube_case) ).x);
+
+        distinct_edges =
+	    ivec4(
+		    ( (( 0x0 != ( intersected_edges & 0x1   )  && (unflattened_local_cell_sampling_index.x  < UNPADDED_WG_SIZE_X ) )  ) ? 1 : 0),
+		    ( ( 0x0 != ( intersected_edges & 0x8   ) && (unflattened_local_cell_sampling_index.y  < UNPADDED_WG_SIZE_Y )) ? 1 : 0),
+		    ( ( 0x0 != ( intersected_edges & 0x100 ) && (unflattened_local_cell_sampling_index.z  < UNPADDED_WG_SIZE_Z ) ) ? 1 : 0), 
+            0);
+
+	    distinct_edges.w = int(dot( vec3(distinct_edges.xyz), vec3(1.0, 1.0, 1.0)));
+
+
+
+        if (is_core_cell) {
+            num_triangles_to_extract += texelFetch(total_num_triangles_per_cell_tri_table, int(cube_case)).x;
+        }
+    }
+
+
+    const uint num_actual_vertices_to_extract = distinct_edges[0] +  distinct_edges[1] + distinct_edges[2];
+
+
+    //VERTEX OFFSET REDUCTION
+    uint intra_warp_vertex_write_offset = 0;
+    uint intra_block_vertex_offset = 0;
+    uint inter_block_vertex_offset = 0;
+
+
+    uint32_t total_num_vertices_in_block = 0;
+    {
+      //per warp: careful, we have several warps for a block.
+      intra_warp_vertex_write_offset = num_actual_vertices_to_extract;
+  
+      // inclusive prefix sum for the subgroup
+      intra_warp_vertex_write_offset = subgroupInclusiveAdd(intra_warp_vertex_write_offset);
+
+      uint total_num_vertices_to_extract_in_warp = 0;
+      // broadcast the inclusive prefix sum results to all threads
+      total_num_vertices_to_extract_in_warp = subgroupBroadcast(intra_warp_vertex_write_offset, last_thread_in_warp);
+  
+      if(0 == lane_idx) {
+        shared_warp_vertex_results[warp_idx] = total_num_vertices_to_extract_in_warp;
+      }
+      barrier();
+      memoryBarrierShared();
+
+
+      if(0 == warp_idx) {
+        if(lane_idx < NUM_ACTIVE_WARPS_IN_WORK_GROUP) {
+          intra_block_vertex_offset = shared_warp_vertex_results[lane_idx];
+        } else {
+          intra_block_vertex_offset = 0;
+        }
+
+        intra_block_vertex_offset = subgroupExclusiveAdd(intra_block_vertex_offset);
+
+        if(lane_idx < NUM_ACTIVE_WARPS_IN_WORK_GROUP) {//7 will contain the global offset for the entire block that is shared among warps
+          shared_warp_vertex_results[lane_idx] = intra_block_vertex_offset; 
+        }
+    
+        if(NUM_ACTIVE_WARPS_IN_WORK_GROUP == lane_idx) {
+          inter_block_vertex_offset = atomicAdd(num_extracted_vertices_atomic_counter, intra_block_vertex_offset);
+          shared_warp_vertex_results[lane_idx] = inter_block_vertex_offset;
+
+          total_num_vertices_in_block = intra_block_vertex_offset;
+        }
+      }
+      barrier();
+      memoryBarrierShared();
+      
+      
+
+      if(0 == lane_idx) {
+        //read global block offset
+        inter_block_vertex_offset = shared_warp_vertex_results[NUM_ACTIVE_WARPS_IN_WORK_GROUP];
+      }
+      inter_block_vertex_offset = subgroupBroadcast(inter_block_vertex_offset, 0);
+      intra_block_vertex_offset = shared_warp_vertex_results[warp_idx];
+
+      
+  
+       
+      //  subtract the number of vertices extracted for each thread to obtain the exclusive prefix sum corresponding 
+      //  to the dense write offset into the index and vertex buffer offset for the mesh shader work group
+      
+      intra_warp_vertex_write_offset -= num_actual_vertices_to_extract;
+    }
+
+  
+  vertex_index_bitmasks[unflattened_local_cell_sampling_index.z][unflattened_local_cell_sampling_index.y][unflattened_local_cell_sampling_index.x]
+    = uint16_t( (distinct_edges[0] << 15) 
+    | (distinct_edges[1] << 14) 
+    | (distinct_edges[2] << 13) 
+    | (intra_block_vertex_offset + intra_warp_vertex_write_offset)
+    );
+    
+  barrier();
+  memoryBarrierShared();
+
+  uint local_vertex_write_offset = inter_block_vertex_offset + intra_block_vertex_offset + intra_warp_vertex_write_offset;
+
+
+    vec3 vertex_position = (cell_sampling_index)*extraction_parameters_UBO.voxel_size.xyz;
+
+    uint32_t occupied_vertex_indices[3] = {uint32_t(0u), uint32_t(0u), uint32_t(0u)};
+
+    uint32_t occupied_index_write_index = 0;
+    #pragma unroll
+    for(uint32_t potentially_occupied_edge_idx = 0; potentially_occupied_edge_idx < 3; ++potentially_occupied_edge_idx) {
+        if(1 == distinct_edges[potentially_occupied_edge_idx]) {
+            occupied_vertex_indices[occupied_index_write_index] = potentially_occupied_edge_idx;
+
+            ++occupied_index_write_index;
+        }
+    }
+
+
+    mat3x3 vertices_to_sample = {
+        vertex_interp(current_iso_value, vertex_position, vertex_position + extraction_parameters_UBO.voxel_size.xww, sampled_values[0], sampled_values[1]),
+        vertex_interp(current_iso_value, vertex_position + extraction_parameters_UBO.voxel_size.wyw, vertex_position, sampled_values[3], sampled_values[0]),
+        vertex_interp(current_iso_value, vertex_position, vertex_position + extraction_parameters_UBO.voxel_size.wwz, sampled_values[0], sampled_values[4])
+    };
+
+    uint32_t num_vertices_written = 0;
+    for (uint32_t occupied_edge_idx = 0; occupied_edge_idx < distinct_edges.w; ++occupied_edge_idx) {
+        const uint32_t CURRENT_WRITE_INDEX = occupied_vertex_indices[occupied_edge_idx];
+
+        vec3 vertex_position_to_write = vertices_to_sample[CURRENT_WRITE_INDEX];
+        write_extracted_vertex_position(local_vertex_write_offset + num_vertices_written, vertex_position_to_write);
+        write_extracted_vertex_normals(local_vertex_write_offset + num_vertices_written, normalize(sample_gradient(vertex_position_to_write.xyz)));
+
+
+        ++num_vertices_written;
+    }
+
+
+  //TRIANGLE OFFSET REDUCTION
+  uint intra_warp_triangle_write_offset = 0;
+  uint intra_block_triangle_offset = 0;
+  uint inter_block_triangle_offset = 0;
+  {
+      //per warp: careful, we have several warps for a block.
+      intra_warp_triangle_write_offset = num_triangles_to_extract;
+
+      // inclusive prefix sum for the subgroup
+      intra_warp_triangle_write_offset = subgroupInclusiveAdd(intra_warp_triangle_write_offset);
+
+      uint total_num_triangles_to_extract_in_warp = 0;
+      // broadcast the inclusive prefix sum results to all threads
+      total_num_triangles_to_extract_in_warp = subgroupBroadcast(intra_warp_triangle_write_offset, last_thread_in_warp);
+
+      if(0 == lane_idx) {
+        shared_warp_vertex_results[warp_idx] = total_num_triangles_to_extract_in_warp;
+      }
+      barrier();
+      memoryBarrierShared();
+
+      if(0 == warp_idx) {
+        if(lane_idx < NUM_ACTIVE_WARPS_IN_WORK_GROUP) {
+          intra_block_triangle_offset = shared_warp_vertex_results[lane_idx];
+        } else {
+          intra_block_triangle_offset = 0;
+        }
+
+        intra_block_triangle_offset = subgroupExclusiveAdd(intra_block_triangle_offset);
+
+        if(lane_idx < NUM_ACTIVE_WARPS_IN_WORK_GROUP) {//17 will contain the global offset for the entire block that is shared among warps
+          shared_warp_vertex_results[lane_idx] = intra_block_triangle_offset; 
+        }
+    
+
+
+        if(NUM_ACTIVE_WARPS_IN_WORK_GROUP == lane_idx) {
+          inter_block_triangle_offset = atomicAdd(num_extracted_indices_atomic_counter, intra_block_triangle_offset);
+          shared_warp_vertex_results[lane_idx] = inter_block_triangle_offset;
+
+#ifdef SHADER_VARIANT_BLOCKWISE_ENCODING
+          const uint32_t block_based_info_write_offset
+            = NUM_BLOCK_BASED_DRAW_CALL_HEADER_SSBO_UINT32_SLOTS +
+              NUM_FILTERED_BLOCK_BASED_DRAW_CALL_COMPONENTS_COUNTER_SSBO_UINT32_OFFSET * TOTAL_NUM_BLOCKS_IN_VOLUME
+              + BLOCK_BASED_INDIRECT_DRAW_CALL_COMPONENTS * (NUM_FILTERED_BLOCK_BASED_DRAW_CALL_COMPONENTS_COUNTER_SSBO_UINT32_OFFSET * TOTAL_NUM_BLOCKS_IN_VOLUME + flattened_work_group_index);
+
+          per_frame_indirect_draw_parameter_buffer[block_based_info_write_offset  + 0] = intra_block_triangle_offset * 3;
+          per_frame_indirect_draw_parameter_buffer[block_based_info_write_offset  + 1  ] = 1;
+          per_frame_indirect_draw_parameter_buffer[block_based_info_write_offset  + 2  ] = inter_block_triangle_offset * 3;
+          per_frame_indirect_draw_parameter_buffer[block_based_info_write_offset  + 3  ] = int(inter_block_vertex_offset);
+          per_frame_indirect_draw_parameter_buffer[block_based_info_write_offset  + 4  ] = 1;
+#endif //SHADER_VARIANT_BLOCKWISE_ENCODING
+
+
+#ifdef SHADER_VARIANT_MESHLET_CONFORMANT_ENCODING
+
+    if(intra_block_triangle_offset < MAX_TRIANGLES_TO_EXTRACT_MESH_SHADER_PMB && total_num_vertices_in_block < MAX_VERTICES_TO_EXTRACT_MESH_SHADER_PMB) {
+
+        meshlet_geometry_info_t meshlet_geometry_info_object_to_write = {inter_block_vertex_offset, inter_block_triangle_offset * 3, total_num_vertices_in_block, intra_block_triangle_offset};
+        meshlet_geometry_info[flattened_work_group_index] = meshlet_geometry_info_object_to_write;
+
+    } else {
+        meshlet_geometry_info_t meshlet_geometry_info_object_to_write = {0, 0, 0, 0};
+        
+        meshlet_geometry_info[flattened_work_group_index] = meshlet_geometry_info_object_to_write;
+    }
+
+
+        atomicAdd(vertex_per_meshlet_histogram_counters(total_num_vertices_in_block-1), 1);
+        atomicAdd(triangle_per_meshlet_histogram_counters(intra_block_triangle_offset-1), 1);
+
+        #ifdef PASS_THROUGH_EXTRACTION_BLOCK_IDS
+            extraction_block_id_as_culling_info[flattened_work_group_index] = flat_occupied_block_index;
+        #endif //PASS_THROUGH_EXTRACTION_BLOCK_IDS
+
+#endif //SHADER_VARIANT_MESHLET_CONFORMANT_ENCODING
+
+        }
+      }
+      barrier();
+      memoryBarrierShared();
+
+      if(0 == lane_idx) {
+        //read global block offset
+        inter_block_triangle_offset = shared_warp_vertex_results[NUM_ACTIVE_WARPS_IN_WORK_GROUP];
+      }
+      inter_block_triangle_offset = subgroupBroadcast(inter_block_triangle_offset, 0);
+      intra_block_triangle_offset = shared_warp_vertex_results[warp_idx];
+  
+       
+      //  subtract the number of vertices extracted for each thread to obtain the exclusive prefix sum corresponding 
+      //  to the dense write offset into the index and vertex buffer offset for the mesh shader work group
+      
+      intra_warp_triangle_write_offset -= num_triangles_to_extract;
+  }
+
+
+  const uint thread_base_write_offset = inter_block_vertex_offset + intra_block_vertex_offset + intra_warp_vertex_write_offset;
+
+  uint global_triangle_write_offset = inter_block_triangle_offset + intra_block_triangle_offset + intra_warp_triangle_write_offset;
+
+
+  ivec3 thread_to_cell_handling_index = ivec3(index_to_xyz_padded(gl_LocalInvocationIndex, UNPADDED_BLOCK_SIZE_X, UNPADDED_BLOCK_SIZE_Y, UNPADDED_BLOCK_SIZE_Z));
+
+  for (uint local_triangle_to_generate_idx = 0; local_triangle_to_generate_idx < num_triangles_to_extract; ++local_triangle_to_generate_idx) {
+
+      uint edge_table_base_offset = (cube_case) * 5 + (local_triangle_to_generate_idx);
+
+      uint edge_indices_combined = texelFetch(packed_16_bit_vertices_tri_table, int(edge_table_base_offset)).x;
+      uint8_t edge_indices_unpacked[3] = {uint8_t(edge_indices_combined & 0xF), uint8_t((edge_indices_combined >> 4) & 0xF), uint8_t(edge_indices_combined >> 8)};
+
+      uint32_t vertex_indices_to_write[3] = {0, 0, 0};
+
+#pragma unroll
+      for (int local_tri_vertex_idx_index = 0; local_tri_vertex_idx_index < 3; ++local_tri_vertex_idx_index) {
+          uint8_t edge_idx = edge_indices_unpacked[local_tri_vertex_idx_index];
+
+          const uint neighbor_mapping_table_entry = neighbor_mapping_table_const_memory[edge_idx];
+
+          uvec4 decoded_neighbor_mapping_entry 
+              = uvec4((neighbor_mapping_table_entry >> 4), (neighbor_mapping_table_entry >> 3) & 0x1, (neighbor_mapping_table_entry >> 2) & 0x1, neighbor_mapping_table_entry & 0x3);
+
+          
+
+          uint32_t curr_bitmask
+              = vertex_index_bitmasks[thread_to_cell_handling_index.z + decoded_neighbor_mapping_entry.z]
+              [thread_to_cell_handling_index.y + decoded_neighbor_mapping_entry.y]
+              [thread_to_cell_handling_index.x + decoded_neighbor_mapping_entry.x];
+
+          uint32_t intra_block_vertex_offset = curr_bitmask & 0x1fff;
+          uint32_t xyzEdge[3];
+          xyzEdge[0] = curr_bitmask >> 15;
+          xyzEdge[1] = curr_bitmask >> 14 & 0x1;
+          xyzEdge[2] = curr_bitmask >> 13 & 0x1;
+
+          uint32_t edge_sum = 0;
+          for (int ref_tri_vert_idx = 0; ref_tri_vert_idx < decoded_neighbor_mapping_entry.w; ++ref_tri_vert_idx) {
+              edge_sum += xyzEdge[ref_tri_vert_idx];
+          }
+
+          vertex_indices_to_write[local_tri_vertex_idx_index] =
+
+#if  !(defined(SHADER_VARIANT_BLOCKWISE_ENCODING) || defined(SHADER_VARIANT_MESHLET_CONFORMANT_ENCODING))
+    inter_block_vertex_offset +
+#endif //SHADER_VARIANT_BLOCKWISE_ENCODING
+
+          edge_sum + intra_block_vertex_offset;
+      }
+
+
+    uint32_t global_vertex_index_write_offset = 3 * (global_triangle_write_offset + local_triangle_to_generate_idx);
+    
+    #pragma unroll
+    for (uint local_vertex_idx_index = 0; local_vertex_idx_index < 3; ++local_vertex_idx_index) {
+        extracted_triangle_indices[global_vertex_index_write_offset + local_vertex_idx_index] = 
+        
+#if !(defined(SHADER_VARIANT_LOCAL_8_BIT_INDICES) || defined(SHADER_VARIANT_LOCAL_16_BIT_INDICES))
+           
+#endif //SHADER_VARIANT_LOCAL_32_BIT_INDICES
+#ifdef SHADER_VARIANT_LOCAL_16_BIT_INDICES
+          uint16_t 
+#endif //SHADER_VARIANT_LOCAL_32_BIT_INDICES
+#ifdef SHADER_VARIANT_LOCAL_8_BIT_INDICES
+          uint8_t 
+#endif //SHADER_VARIANT_LOCAL_32_BIT_INDICES
+        (vertex_indices_to_write[local_vertex_idx_index]);
+    }
+
+  }
+
+
+}

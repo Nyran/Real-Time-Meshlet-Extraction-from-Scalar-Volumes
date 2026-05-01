@@ -1,0 +1,199 @@
+#version 460 core
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+#extension GL_EXT_mesh_shader : require
+#else
+#define USES_NV_MESH_SHADER_EXTENSION
+#extension GL_NV_mesh_shader : require
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : enable
+
+#define SHADER_VARIANT_LOCAL_8_BIT_INDICES
+
+#ifdef USES_NV_MESH_SHADER_EXTENSION
+layout(local_size_x=32) in;
+#else //USES_EXT_MESH_SHADER_EXTENSION
+layout(local_size_x=32) in;
+#endif 
+
+#ifndef MAX_VERTICES_AND_TRIANGLES_DEFINED_BY_SHADER_VARIANT
+#ifndef LARGEST_POSSIBLE_OUTPUT
+#define MAX_VERTS 128
+#define MAX_TRIS 254
+
+#endif //LARGEST_POSSIBLE_OUTPUT
+#endif //MAX_VERTICES_NOT_DEFINED_BY_SHADER_VARIANT
+
+
+
+layout(max_vertices=MAX_VERTS,
+       max_primitives=MAX_TRIS) out;
+layout(triangles) out;
+
+#define PER_PRIMITIVE_CULLING
+
+//perform per primitive culling as shown by Arseny Kapoulkine (https://github.com/zeux/niagara/blob/master/src/shaders/meshlet.mesh.glsl)
+#ifdef PER_PRIMITIVE_CULLING
+
+#if defined(USES_EXT_MESH_SHADER_EXTENSION)
+  #define CLIPPOS(id) gl_MeshVerticesEXT[id].gl_Position.xyw;
+#else
+  #define CLIPPOS(id) gl_MeshVerticesNV[id].gl_Position.xyw;
+#endif
+
+#endif //PER_PRIMITIVE_CULLING
+
+#define PRIMITIVE_TYPE_TRIANGLE_LIST
+#include "../../shader_includes/abstract_mesh_shader_submission_interface.glsl"
+#include "../../shader_includes/defines.glsl"
+#include "../../shader_includes/volumes.glsl"
+
+#include "../../shader_includes/ssbos.glsl"
+
+
+
+
+
+#ifndef PASS_NOTHING
+layout(location = 0) out Interpolant {
+#ifdef PASS_VOLUME_SPACE_POSITION
+vec3 volume_space_position;
+#endif
+vec3 ws_position;
+#if !(defined PASS_EXTRACTION_REGION_SIZE_COLOR)
+vec3 ws_normal;
+#endif //!(defined PASS_EXTRACTION_REGION_SIZE_COLOR)
+#ifdef PASS_MESHLET_RANDOM_ID
+flat uint32_t pseudorandom_patch_id;
+#endif
+#ifdef PASS_MESHLET_SIZE_BUCKET_ID
+flat uint8_t meshlet_size_bucket;
+#endif
+#ifdef PASS_EXTRACTION_REGION_SIZE_COLOR
+vec3 extraction_region_size_color;
+#endif
+} OUT[];
+#endif
+
+//only define interface in task + mesh shader branch
+#ifdef TASK_AND_MESH_COMBINATION
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+struct task_to_mesh_shader_extraction_payload {
+    #include "triangle_forward_rendering_task_mesh_shader_interface.glsl"
+};
+ taskPayloadSharedEXT task_to_mesh_shader_extraction_payload IN;
+#else //USES_NV_MESH_SHADER_EXTENSION
+taskNV in Task {
+    #include "triangle_forward_rendering_task_mesh_shader_interface.glsl"
+} IN;
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+#endif
+
+#include "../../shader_includes/per_frame_indirect_draw_parameter_ssbo.glsl"
+
+
+void main() {
+    // fetch group info
+#ifndef TASK_AND_MESH_COMBINATION
+    //mesh shader only branch
+    uint meshlet_index = gl_WorkGroupID.x;
+#else
+    //task+mesh shader branch
+#ifndef USE_MESHOPTIMIZER_STYLE_RENDERER
+    uint meshlet_index = IN.absoluteIDs[gl_WorkGroupID.x];
+#else //USE_MESHOPTIMIZER_STYLE_RENDERER
+    uint meshlet_index = IN.baseID + IN.baseIDOffset[gl_WorkGroupID.x];
+#endif //USE_MESHOPTIMIZER_STYLE_RENDERER
+#endif
+
+    meshlet_geometry_info_t meshlet_voff_vcnt_ioff_icnt = meshlet_geometry_info[meshlet_index];
+
+    // fetch & forward vertex info
+    for(uint32_t vertex_to_write_index = gl_LocalInvocationIndex; vertex_to_write_index < meshlet_voff_vcnt_ioff_icnt.v_count; vertex_to_write_index += gl_WorkGroupSize.x) {
+#ifndef USE_MESHOPTIMIZER_STYLE_RENDERER
+        uint32_t global_vertex_read_offset = meshlet_voff_vcnt_ioff_icnt.v_offset + vertex_to_write_index; // PATH FOR OURS
+#else //USE_MESHOPTIMIZER_STYLE_RENDERER
+        uint32_t global_vertex_read_offset = meshoptimizer_path_meshlet_vertex_base_offset_indices[ meshlet_voff_vcnt_ioff_icnt.v_offset + vertex_to_write_index ]; //PATH FOR MESHOPTIMIZER
+#endif //USE_MESHOPTIMIZER_STYLE_RENDERER
+
+        vec4 extracted_vertex_position = vec4(read_extracted_vertex_position(global_vertex_read_offset), 1.0);
+
+        vec4 projected_vertex = combined_model_point_of_view_camera_UBO.model_view_projection_mat * extracted_vertex_position;
+        write_position_extension_independent(vertex_to_write_index, projected_vertex);
+
+#ifndef PASS_NOTHING
+
+#ifdef PASS_VOLUME_SPACE_POSITION
+        OUT[vertex_to_write_index].volume_space_position = extracted_vertex_position.xyz;
+#endif //PASS_VOLUME_SPACE_POSITION
+
+        OUT[vertex_to_write_index].ws_position = (model_UBO.model_mat * extracted_vertex_position).xyz;
+#if !defined PASS_EXTRACTION_REGION_SIZE_COLOR
+        OUT[vertex_to_write_index].ws_normal =  normalize((combined_model_point_of_view_camera_UBO.normal_mat * vec4( read_extracted_vertex_normals(global_vertex_read_offset), 0.0)).xyz);
+#endif //ifdef PASS_EXTRACTION_REGION_SIZE_COLOR
+#ifdef PASS_MESHLET_RANDOM_ID
+        OUT[vertex_to_write_index].pseudorandom_patch_id = (gl_WorkGroupID.x % 27);
+#endif
+
+#ifdef PASS_EXTRACTION_REGION_SIZE_COLOR
+        //for simplicity (and since it is not a performance measuring mode), we extracted the region-size based color in the compute shader as normal attribute and pass it on
+        OUT[vertex_to_write_index].extraction_region_size_color = read_extracted_vertex_normals(global_vertex_read_offset).xyz;
+#endif //PASS_EXTRACTION_REGION_SIZE_COLOR
+
+#ifdef PASS_BLOCK_INDEX_ORDER_IN_SSBO
+#ifndef TASK_AND_MESH_COMBINATION
+        //mesh shader only branch
+        OUT[vertex_to_write_index].block_index_order_in_ssbo = gl_WorkGroupID.x;
+#else
+        //task + mesh shader branch
+        OUT[vertex_to_write_index].block_index_order_in_ssbo = IN.baseIDs[gl_WorkGroupID.x];
+#endif
+#endif
+#endif //PASS_NOTHING
+    }
+
+
+    const uint32_t meshlet_index_offset = uint32_t(meshlet_voff_vcnt_ioff_icnt.t_offset);
+    const uint32_t meshlet_primitive_count = uint32_t(meshlet_voff_vcnt_ioff_icnt.t_count);
+
+    // fetch & forward index info
+    for(uint32_t triangle_base_offset = gl_LocalInvocationIndex; triangle_base_offset < meshlet_primitive_count; triangle_base_offset += gl_WorkGroupSize.x) {
+        uint32_t index_base_offset = triangle_base_offset * 3;
+
+        const uint32_t meshlet_index_buffer_read_offset =  meshlet_index_offset + index_base_offset;
+
+        uvec3 indices_to_write = {
+                                    extracted_triangle_indices[meshlet_index_buffer_read_offset],
+                                    extracted_triangle_indices[meshlet_index_buffer_read_offset + 1],
+                                    extracted_triangle_indices[meshlet_index_buffer_read_offset + 2]
+                                 };
+
+        bool keep_primitive = true;
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+#ifdef PER_PRIMITIVE_CULLING
+        vec3 pa = CLIPPOS(indices_to_write.x);
+        vec3 pb = CLIPPOS(indices_to_write.y);
+        vec3 pc = CLIPPOS(indices_to_write.z);
+
+        // backface culling + zero-area culling
+        vec2 eb = pb.xy - pa.xy;
+        vec2 ec = pc.xy - pa.xy;
+
+        keep_primitive = keep_primitive || (eb.x * ec.y <= eb.y * ec.x);
+        keep_primitive = keep_primitive && (pa.z > 0 && pb.z > 0 && pc.z > 0);
+
+        gl_MeshPrimitivesEXT[triangle_base_offset].gl_CullPrimitiveEXT = !keep_primitive;
+#endif //PER_PRIMITIVE_CULLING
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+        if(keep_primitive) {
+            write_triangle_primitive_indices_extension_independent(triangle_base_offset, indices_to_write);
+        }
+    }
+
+    // pass on number of primitives in meshlets
+    if(0 == gl_LocalInvocationIndex) {
+        write_num_primitives_extension_independent(meshlet_voff_vcnt_ioff_icnt.v_count, meshlet_primitive_count);
+    }
+}

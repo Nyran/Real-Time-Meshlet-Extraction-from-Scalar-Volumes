@@ -1,0 +1,70 @@
+#version 460 core
+
+#extension GL_NV_mesh_shader : require
+
+#include "../shader_includes/volumes.glsl"
+#include "../shader_includes/ssbos.glsl"
+
+layout (location = 0) out Interpolant {
+flat uint camera_id;
+} OUT[];
+
+layout(local_size_x=32) in;
+
+
+layout(max_vertices=8, max_primitives=12) out;
+
+layout(lines) out; 
+
+vec3 normalized_cube_coordinates[8] = {
+  {-1, -1, -1}, {1, -1, -1},
+  {-1,  1, -1}, {1,  1, -1},
+  {-1, -1,  1}, {1, -1,  1},
+  {-1,  1,  1}, {1,  1,  1}
+};
+
+uint8_t box_line_indices[24] = {
+  //front 
+  uint8_t(0), uint8_t(1),
+  uint8_t(0), uint8_t(2),
+  uint8_t(1), uint8_t(3),
+  uint8_t(2), uint8_t(3),
+
+  //back
+  uint8_t(4), uint8_t(5),
+  uint8_t(4), uint8_t(6),
+  uint8_t(5), uint8_t(7),
+  uint8_t(6), uint8_t(7),
+
+  //front-to-back
+  uint8_t(0), uint8_t(4),
+  uint8_t(1), uint8_t(5),
+  uint8_t(2), uint8_t(6),
+  uint8_t(3), uint8_t(7)
+
+};
+
+
+void main() {  
+
+
+
+
+  if(gl_LocalInvocationIndex < 8) {
+    vec3 vertex_position_to_project 
+    =  normalized_cube_coordinates[gl_LocalInvocationIndex];
+
+    gl_MeshVerticesNV[gl_LocalInvocationIndex].gl_Position = point_of_view_camera_UBO.view_projection_mat * culling_reference_camera_UBO.inverse_view_projection_mat * vec4(vertex_position_to_project, 1.0);
+    OUT[gl_LocalInvocationIndex].camera_id = 0;
+  }
+
+  if(gl_LocalInvocationIndex < 24) {
+    gl_PrimitiveIndicesNV[gl_LocalInvocationIndex] = box_line_indices[gl_LocalInvocationIndex];
+  }
+
+
+  if(0 == gl_LocalInvocationIndex) {
+    gl_PrimitiveCountNV = 12;
+  }
+
+}

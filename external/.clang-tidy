@@ -1,0 +1,8 @@
+---
+# Disable all clang-tidy checks for vendored third-party code.
+# clang-tidy walks up from each translation unit and uses the closest
+# .clang-tidy file, so this overrides the one at the repository root for
+# any sources under external/ (imgui, implot, gl3w, glm, CLI11, glfw, ...).
+Checks: '-*'
+WarningsAsErrors: ''
+HeaderFilterRegex: '$^'

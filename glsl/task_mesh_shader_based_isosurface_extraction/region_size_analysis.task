@@ -1,0 +1,477 @@
+#version 460
+
+#ifndef MAX_OCCUPIED_CELLS_MESH_SHADER_PMB
+#define MAX_OCCUPIED_CELLS_MESH_SHADER_PMB 96
+#endif //MAX_OCCUPIED_CELLS_MESH_SHADER_PMB
+
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+#extension GL_EXT_mesh_shader : require
+#else
+#extension GL_NV_mesh_shader : require
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+
+#extension GL_ARB_gpu_shader_int64 : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x=32) in;
+
+#include "../shader_includes/abstract_task_shader_submission_interface.glsl"
+#include "../shader_includes/volumes.glsl"
+
+#define SHADER_VARIANT_LOCAL_8_BIT_INDICES
+
+#include "../shader_includes/defines.glsl"
+#include "../shader_includes/atomic_counters.glsl"
+#include "../shader_includes/ssbos.glsl"
+#include "../shader_includes/marching_cubes_tables.glsl"
+#include "../shader_includes/math.glsl"
+
+/*
+  Region Analysis Task Shader (paper Sec. 3.2.1, supplementary Listing 1)
+  =======================================================================
+
+  ROLE. One task-shader workgroup (32 threads) analyses one occupied 8x8x4
+  extraction block and decides how many meshlets to emit (1..32) and at which
+  subblock granularity. It writes the per-meshlet payload defined in
+  extraction_task_mesh_shader_interface.glsl and reserves global SSBO ranges
+  for vertices, indices and meshlet descriptors via atomic counters.
+
+  INPUT.
+    - dense_occupied_block_indices[gl_WorkGroupID.x] -> 1D index of the 8x8x4
+      block this workgroup is responsible for (built upstream by the
+      occupancy compute shaders).
+    - The volume sampler (volTexSize, sample_volume) and the current isovalue.
+
+  ALGORITHM.
+    1. Sample the padded 9x9x5 cell region into shared_volume (one bit per cell:
+       below or above isovalue).
+    2. For each of 32 disjoint 2x2x2 thread regions (Morton-ordered), classify
+       its 8 cells: count vertices/triangles, flag padding cells for each of
+       the three candidate subblock sizes (smallest/medium/largest).
+    3. Largest-region check (one decision for all 32 threads): if the entire
+       8x8x4 block fits the meshlet limits, emit a single LARGEST_REGION
+       meshlet and write its occupied-cell indices into the payload.
+    4. Otherwise, group threads into 8 clusters of 4 and check whether each
+       4x4x4 subblock fits MEDIUM_SIZED_REGION limits. Subblocks that fit emit
+       one meshlet each; subblocks that do not fall back to SMALLEST_REGION
+       (one 2x2x2 meshlet per occupied thread).
+    5. After meshlet count is known, atomicAdd on the global counters reserves
+       contiguous ranges in the meshlet/vertex/triangle SSBOs and stores them
+       in the payload, then the mesh-shader workgroup count is written for the
+       indirect mesh-shader dispatch.
+
+  OUTPUT. The payload (see extraction_task_mesh_shader_interface.glsl) plus
+  reserved global offsets. The number of meshlets emitted by this task shader
+  equals the number of mesh-shader workgroups dispatched.
+
+  CONSTANTS. MAX_VERTICES_TO_EXTRACT_MESH_SHADER_PMB and
+  MAX_TRIANGLES_TO_EXTRACT_MESH_SHADER_PMB (defines.glsl) cap a meshlet's
+  vertex / triangle count; MAX_OCCUPIED_CELLS_MESH_SHADER_PMB caps how many
+  cells a single mesh-shader workgroup can process and bounds the size of the
+  occupied_cells_less_than_995 payload.
+*/
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+struct task_to_mesh_shader_extraction_payload {
+    #include "extraction_task_mesh_shader_interface.glsl"
+};
+taskPayloadSharedEXT task_to_mesh_shader_extraction_payload OUT;
+#else //USES_NV_MESH_SHADER_EXTENSION
+taskNV out Task {
+    #include "extraction_task_mesh_shader_interface.glsl"
+} OUT;
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+
+const uint offsets_as_binary_mask = 0xEE9CA0;
+
+shared uint32_t shared_volume[PADDED_BLOCK_SIZE_Z][PADDED_BLOCK_SIZE_Y][PADDED_BLOCK_SIZE_X];
+
+const uint8_t flat_block_reconstruction_offset_largest_area[26] = {
+    uint8_t(  0), uint8_t(  1), uint8_t(  2),
+    uint8_t(  9), uint8_t( 10), uint8_t( 11),
+    uint8_t( 18), uint8_t( 19), uint8_t( 20),
+    uint8_t( 81), uint8_t( 82), uint8_t( 83),
+    uint8_t( 90), uint8_t( 91), uint8_t( 92),
+    uint8_t( 99), uint8_t(100), uint8_t(101),
+    uint8_t(162), uint8_t(163), uint8_t(164),
+    uint8_t(171), uint8_t(172), uint8_t(173),
+    uint8_t(180), uint8_t(181)
+};
+
+const uint8_t flat_block_reconstruction_offset_medium_area[26] = {
+    uint8_t( 0), uint8_t( 1), uint8_t( 2),
+    uint8_t( 5), uint8_t( 6), uint8_t( 7),
+    uint8_t(10), uint8_t(11), uint8_t(12),
+    uint8_t(25), uint8_t(26), uint8_t(27),
+    uint8_t(30), uint8_t(31), uint8_t(32),
+    uint8_t(35), uint8_t(36), uint8_t(37),
+    uint8_t(50), uint8_t(51), uint8_t(52),
+    uint8_t(55), uint8_t(56), uint8_t(57),
+    uint8_t(60), uint8_t(61)
+};
+
+
+void main() {
+    uint32_t NUM_MESH_SHADER_WORKGROUPS_TO_EMIT = 0;
+
+    const int occupied_block_index = int(dense_occupied_block_indices[gl_WorkGroupID.x]);
+    // compute 3D indices for sampling correct task mesh shader block
+    const int one_d_macro_block_index = occupied_block_index;
+
+    const ivec3 num_blocks_per_dimension = volTexSize / ivec3(UNPADDED_BLOCK_SIZE_X, UNPADDED_BLOCK_SIZE_Y, UNPADDED_BLOCK_SIZE_Z);
+
+    const ivec3 unflattened_block_index = unflatten_one_d_index(one_d_macro_block_index, ivec2(num_blocks_per_dimension.x, num_blocks_per_dimension.x * num_blocks_per_dimension.y));
+
+    ivec3 macro_block_start_offset = unflattened_block_index * ivec3(UNPADDED_BLOCK_SIZE_X, UNPADDED_BLOCK_SIZE_Y, UNPADDED_BLOCK_SIZE_Z);
+
+    uvec3 level_1_z_order_id = one_d_to_morton_442(gl_LocalInvocationIndex);
+    uvec3 level_1_z_order_id_times_two = level_1_z_order_id << 1;
+
+    bool is_any_in_subblock_occupied = false;
+
+    uint32_t occupancy_bit_pattern_core_cells = 0x0;
+    uint32_t occupancy_bit_pattern_padding_cells_222 = 0x0;
+    uint32_t occupancy_bit_pattern_padding_cells_444 = 0x0;
+    uint32_t occupancy_bit_pattern_padding_cells_884 = 0x0;
+
+    uint32_t num_vertices_to_extract_core_cells = 0;
+    uint32_t num_triangles_to_extract_core_cells = 0;
+
+    #define CORE_CELLS_COUNT_ARRAY_ID 0
+    #define PADDING_CELLS_SMALLEST_REGION_COUNT_ARRAY_ID 1
+    #define PADDING_CELLS_MEDIUM_SIZED_REGION_COUNT_ARRAY_ID 2
+    #define PADDING_CELLS_LARGEST_REGION_COUNT_ARRAY_ID 3
+    #define TOTAL_NUM_CELL_COUNTERS 4
+
+    #define PADDING_CELL_VERTEX_COUNT_SMALLEST_REGION 0
+    #define PADDING_CELL_VERTEX_COUNT_MEDIUM_SIZED_REGION 1
+    #define PADDING_CELL_VERTEX_COUNT_LARGEST_REGION 2
+    #define TOTAL_NUM_PADDING_CELL_VERTEX_COUNTERS 3
+
+    uint32_t occupied_cell_counters[TOTAL_NUM_CELL_COUNTERS] = {0, 0, 0, 0};
+
+    #define USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+
+    #ifdef USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+    uint32_t PADDING_CELL_vertex_counters[TOTAL_NUM_PADDING_CELL_VERTEX_COUNTERS] = {0, 0, 0};
+    #endif //USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+
+    /* in general, we have (at the very least) 32 threads per work group at our disposal. Therefore, if we divide the block to be analyzed into 32 parts
+       each thread can summarize 1/32th of the entire area. By using subgroup communication between the threads carefully, we can summarize the entire region. */
+
+    /* in this part, we analyze the cells for their marching cubes case and count for the different possible subblock configurations (8x8x4, 4x4x4 or 2x2x2)
+       how many padding cells would be involved in the meshlet creation and how much geometry would be extracted. */
+
+    const float current_iso_value = extraction_parameters_UBO.iso_value;
+
+    for(int flat_cell_sampling_index = int(gl_LocalInvocationIndex); flat_cell_sampling_index < NUM_PADDED_VOXELS_PER_BLOCK; flat_cell_sampling_index += 32) {
+        ivec3 local_index = unflatten_one_d_index(flat_cell_sampling_index, ivec2(PADDED_BLOCK_SIZE_X, NUM_PADDED_VOXELS_PER_XY_SLICE));
+        ivec3 global_index = macro_block_start_offset + local_index;
+
+        const bool is_sample_smaller_than_iso_value = sample_volume(global_index) < current_iso_value;
+        shared_volume[local_index.z][local_index.y][local_index.x] = uint32_t(is_sample_smaller_than_iso_value);
+    }
+    memoryBarrierShared();
+    barrier();
+
+    #pragma unroll
+    for(uint32_t cell_it = 0; cell_it < 8; ++cell_it) {
+        uint halfway_decoded_offset = offsets_as_binary_mask >> (cell_it * 3);
+        uvec3 offset = (uvec3(halfway_decoded_offset) >> ivec3(0, 1, 2)) & 0x1;
+
+        uint32_t cube_index = 0;
+
+        uvec3 unflattened_local_3d_index = level_1_z_order_id_times_two + offset;
+
+        uint x = unflattened_local_3d_index.x;
+        uint y = unflattened_local_3d_index.y;
+        uint z = unflattened_local_3d_index.z;
+
+        cube_index |= shared_volume[z  ][y  ][x  ];
+        cube_index |= shared_volume[z  ][y  ][x+1] << 1;
+        cube_index |= shared_volume[z  ][y+1][x+1] << 2;
+        cube_index |= shared_volume[z  ][y+1][x  ] << 3;
+        cube_index |= shared_volume[z+1][y  ][x  ] << 4;
+        cube_index |= shared_volume[z+1][y  ][x+1] << 5;
+        cube_index |= shared_volume[z+1][y+1][x+1] << 6;
+        cube_index |= shared_volume[z+1][y+1][x  ] << 7;
+
+        /* establish MC case */
+        if((0 != cube_index) && (255 != cube_index)) {
+            occupancy_bit_pattern_core_cells |= (1 << uint(dot(vec3(1, 3, 9), vec3(offset))));
+            ++occupied_cell_counters[CORE_CELLS_COUNT_ARRAY_ID];
+        }
+
+        /* query exact number of triangles in the CORE cells */
+        num_triangles_to_extract_core_cells += texelFetch(total_num_triangles_per_cell_tri_table, int(cube_index)).x;
+
+        //flag whether the cell is the neighbor of a padding cell across any configuration based on simple modulo operations
+        bvec3 is_not_adjacent_to_padding_of_smallest_region = notEqual(unflattened_local_3d_index & UNPADDED_SMALLEST_REGION_SIZE_MINUS_ONE, UNPADDED_SMALLEST_REGION_SIZE_MINUS_ONE);
+        bvec3 is_not_adjacent_to_padding_of_medium_sized_region = notEqual(unflattened_local_3d_index & UNPADDED_MEDIUM_SIZED_REGION_SIZE_MINUS_ONE, UNPADDED_MEDIUM_SIZED_REGION_SIZE_MINUS_ONE);
+        bvec3 is_not_adjacent_to_padding_of_largest_region = notEqual(unflattened_local_3d_index & UNPADDED_LARGEST_REGION_SIZE_MINUS_ONE, UNPADDED_LARGEST_REGION_SIZE_MINUS_ONE);
+
+        uint32_t intersected_edges = (texelFetch(edge_table, int(cube_index)).x);
+
+        //only count bits on edges 0, 3 and 8
+        num_vertices_to_extract_core_cells += bitCount(intersected_edges & 0x109);
+
+        //only keep the bits that do NOT belong to the three unique vertices according to Parallel Marching Blocks
+        intersected_edges &= 0xEF6;
+
+        while(0 != intersected_edges) {
+            uint32_t edge_to_test_idx = findMSB(intersected_edges);
+            intersected_edges &= ~(1 << edge_to_test_idx);
+
+            const uint32_t edgemap = neighbor_mapping_table_const_memory[edge_to_test_idx];
+
+            const ivec3 edge_map_offset = (ivec3(edgemap) >> ivec3(4, 3, 2)) & 0x1;
+            bvec3 active_edge_map_directions = notEqual(edge_map_offset, ivec3(0, 0, 0));
+
+            //unique index in entire macroblock
+            const ivec3 cell_creating_edge = ivec3(unflattened_local_3d_index) + edge_map_offset;
+
+            //unique index in 3x3x3 block
+            ivec3 local_333_index_three_d = cell_creating_edge - ivec3(level_1_z_order_id_times_two);
+            const uint32_t local_333_index_one_d = flatten_three_d_index(local_333_index_three_d, ivec2(3, 9));
+            const uint32_t bitpattern_to_lookup = 1 << local_333_index_one_d;
+
+            // count padding cells in 222 blocks
+            if(!any(bvec3(
+                    active_edge_map_directions.x && is_not_adjacent_to_padding_of_smallest_region.x,
+                    active_edge_map_directions.y && is_not_adjacent_to_padding_of_smallest_region.y,
+                    active_edge_map_directions.z && is_not_adjacent_to_padding_of_smallest_region.z))) {
+                if(0x0 == (occupancy_bit_pattern_padding_cells_222 & bitpattern_to_lookup)) {
+                    ++occupied_cell_counters[PADDING_CELLS_SMALLEST_REGION_COUNT_ARRAY_ID];
+                    occupancy_bit_pattern_padding_cells_222 |= bitpattern_to_lookup;
+                }
+
+                #ifdef USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+                ++PADDING_CELL_vertex_counters[PADDING_CELL_VERTEX_COUNT_SMALLEST_REGION];
+                #endif //USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+            }
+
+            // count padding cells in 444 blocks
+            if(!any(bvec3(
+                    active_edge_map_directions.x && is_not_adjacent_to_padding_of_medium_sized_region.x,
+                    active_edge_map_directions.y && is_not_adjacent_to_padding_of_medium_sized_region.y,
+                    active_edge_map_directions.z && is_not_adjacent_to_padding_of_medium_sized_region.z))) {
+                //check if we flagged this neighbor already with this thread (because the same neighbor can create several vertices)
+                if(0x0 == (occupancy_bit_pattern_padding_cells_444 & bitpattern_to_lookup)) {
+                    ++occupied_cell_counters[PADDING_CELLS_MEDIUM_SIZED_REGION_COUNT_ARRAY_ID];
+                    occupancy_bit_pattern_padding_cells_444 |= bitpattern_to_lookup;
+                }
+
+                #ifdef USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+                ++PADDING_CELL_vertex_counters[PADDING_CELL_VERTEX_COUNT_MEDIUM_SIZED_REGION];
+                #endif //USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+            }
+
+            // count padding cells in 884 blocks
+            if(!any(bvec3(
+                    active_edge_map_directions.x && is_not_adjacent_to_padding_of_largest_region.x,
+                    active_edge_map_directions.y && is_not_adjacent_to_padding_of_largest_region.y,
+                    active_edge_map_directions.z && is_not_adjacent_to_padding_of_largest_region.z))) {
+                //check if we flagged this neighbor already with this thread (because the same neighbor can create several vertices)
+                if(0x0 == (occupancy_bit_pattern_padding_cells_884 & bitpattern_to_lookup)) {
+                    ++occupied_cell_counters[PADDING_CELLS_LARGEST_REGION_COUNT_ARRAY_ID];
+                    occupancy_bit_pattern_padding_cells_884 |= bitpattern_to_lookup;
+                }
+
+                #ifdef USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+                ++PADDING_CELL_vertex_counters[PADDING_CELL_VERTEX_COUNT_LARGEST_REGION];
+                #endif //USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+            }
+        }
+    }
+
+    // from here on, we compare our vertex, triangle and cell counts to our configured meshlet geometry and cell limits to decide which blocks we extract geometry from
+    uint32_t num_occupied_cells_in_largest_region_per_thread = occupied_cell_counters[CORE_CELLS_COUNT_ARRAY_ID] + occupied_cell_counters[PADDING_CELLS_LARGEST_REGION_COUNT_ARRAY_ID];
+
+    //pack attributes we are interested in together because subgroup-operations either way operate on 32bit-variables and the contribution per thread
+    //will not make the result overflow
+    //first 10 bit: num occupied cells
+    //next  11 bit: upper bound on vertices to extract
+    //last  11 bit: exact number of triangles to extract
+
+    /* the first subgroupClusteredAdd operations runs for our complete workgroup. This is why every thread of the workgroup has the information
+       about the global geometry and cell count. */
+    const uint32_t complete_region_input = (num_occupied_cells_in_largest_region_per_thread << 22)
+        | ((int(num_vertices_to_extract_core_cells) +
+            #ifdef USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+            int(PADDING_CELL_vertex_counters[PADDING_CELL_VERTEX_COUNT_LARGEST_REGION])
+            #else //!USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+            int(occupied_cell_counters[PADDING_CELLS_LARGEST_REGION_COUNT_ARRAY_ID]) * 2
+            #endif //!USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+        ) << 11) | num_triangles_to_extract_core_cells;
+
+    const uint32_t complete_number_of_vertices_and_triangles_in_large_region = subgroupClusteredAdd(complete_region_input, 32);
+
+    uint32_t complete_number_of_cells_in_large_region = uint32_t(complete_number_of_vertices_and_triangles_in_large_region >> 22);
+
+    ivec2 decoded_num_vertices_and_triangles_large_region = (ivec2(complete_number_of_vertices_and_triangles_in_large_region) >> ivec2(11, 0)) & (0x7FF);
+
+    const ivec3 vector_comparison_lhs = ivec3(complete_number_of_cells_in_large_region, decoded_num_vertices_and_triangles_large_region);
+    const ivec3 vector_comparison_rhs = ivec3(MAX_OCCUPIED_CELLS_MESH_SHADER_PMB, MAX_VERTICES_TO_EXTRACT_MESH_SHADER_PMB, MAX_TRIANGLES_TO_EXTRACT_MESH_SHADER_PMB);
+
+    //globally determine for each thread, whether largest_region is active.
+    //all threads within the work group necessarily take the same path
+    if(all(lessThanEqual(vector_comparison_lhs, vector_comparison_rhs))) {
+        uint32_t occupied_cell_prefix_sum = subgroupExclusiveAdd(num_occupied_cells_in_largest_region_per_thread);
+        uint32_t complete_local_occupancy_pattern = occupancy_bit_pattern_core_cells | occupancy_bit_pattern_padding_cells_884;
+
+        //retrieve occupied cell indices from bit pattern
+        uint32_t write_offset = occupied_cell_prefix_sum * 2;
+        uint32_t flat_base_index = level_1_z_order_id_times_two.x + level_1_z_order_id_times_two.y * 9 + level_1_z_order_id_times_two.z * 81;
+
+        for(int32_t cell_indices_to_check = 0; cell_indices_to_check < 26; ++cell_indices_to_check) {
+            if(0 != ((1 << cell_indices_to_check) & complete_local_occupancy_pattern)) {
+                uint32_t index_to_write = flat_base_index + flat_block_reconstruction_offset_largest_area[cell_indices_to_check];
+
+                //encode 16 bit index into 2x 8 indices
+                OUT.occupied_cells_less_than_995[write_offset++] = uint8_t(index_to_write);
+                OUT.occupied_cells_less_than_995[write_offset++] = uint8_t(index_to_write >> 8);
+            }
+        }
+
+        if(31 == gl_LocalInvocationIndex) {
+            NUM_MESH_SHADER_WORKGROUPS_TO_EMIT = 1;
+            OUT.num_active_cells_in_555_or_995_area_inclusive_prefix_sum[0] = complete_number_of_cells_in_large_region;
+            OUT.dense_occupied_333_or_555_block_indices_and_size_mode[0] = LARGEST_REGION; //index 0 and size mode 0
+            OUT.local_vertex_and_triangle_offset_per_meshlet[0] = uint32_t(0);
+            OUT.baseID = occupied_block_index;
+        }
+    } else {
+        // end of largest block region check. If our isosurface did NOT fit into our entire 8x8x4 block, we will go on with our second check
+        uint32_t num_occupied_cells_in_555_region_per_thread = occupied_cell_counters[CORE_CELLS_COUNT_ARRAY_ID] + occupied_cell_counters[PADDING_CELLS_MEDIUM_SIZED_REGION_COUNT_ARRAY_ID];
+
+        //subgroupClustereAdd calls are peformed with a groupsize of 8, meaning that 8 neighboring threads
+        //will obtain the sum of all vertices, triangles and cells. this allows 8 neighboring threads to make
+        //an informed decision, which is independent of other groups of 8 threads.
+        uint32_t complete_number_of_vertices_and_triangles_in_medium_region = subgroupClusteredAdd(
+            (num_occupied_cells_in_555_region_per_thread << 22) |
+            ((num_vertices_to_extract_core_cells +
+                #ifdef USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+                PADDING_CELL_vertex_counters[PADDING_CELL_VERTEX_COUNT_MEDIUM_SIZED_REGION]
+                #else //!USE_EXACT_VERTEX_COUNT_IN_PMB_ANALYSIS
+                occupied_cell_counters[PADDING_CELLS_MEDIUM_SIZED_REGION_COUNT_ARRAY_ID] * 2
+                #endif
+            ) << 11) | num_triangles_to_extract_core_cells, 8);
+
+        uint32_t complete_number_of_cells_in_555_region = uint32_t(complete_number_of_vertices_and_triangles_in_medium_region >> 22);
+
+        bool encodes_555_region = false;
+        bool encodes_333_region = false;
+
+        //if the isosurface geometry which is extracted by the 8 threads fits into a padded 444 region, we flag it accordingly, ...
+        if((complete_number_of_vertices_and_triangles_in_medium_region & 0x7FF) <= MAX_TRIANGLES_TO_EXTRACT_MESH_SHADER_PMB &&
+           complete_number_of_cells_in_555_region <= MAX_OCCUPIED_CELLS_MESH_SHADER_PMB &&
+           ((complete_number_of_vertices_and_triangles_in_medium_region >> 11) & 0x7FF) <= MAX_VERTICES_TO_EXTRACT_MESH_SHADER_PMB) {
+            encodes_555_region = true;
+        } else { //... otherwise we use our padded 222 subregion as fallback region
+            is_any_in_subblock_occupied = (occupied_cell_counters[CORE_CELLS_COUNT_ARRAY_ID] > 0) && (num_triangles_to_extract_core_cells > 0);
+
+            if(is_any_in_subblock_occupied) {
+                encodes_333_region = true;
+            }
+        }
+
+        bool is_thread_active = encodes_333_region || encodes_555_region;
+        bool does_thread_participate_actively_in_mode_prefix_sum = is_thread_active;
+
+        // the idea here was that only one thread participates in the prefix sum, if we describe a larger region.
+        // since 8 threads summarize a 555 region, we let the first thread out of 8 (% 8 -> & 0x7 participate)
+        if(encodes_555_region) {
+            if(0 != (gl_LocalInvocationIndex & 0x7)) {
+                does_thread_participate_actively_in_mode_prefix_sum = false;
+            }
+        }
+
+        uint32_t num_occupied_cells_in_555_region_to_account_for = 0;
+        if(encodes_555_region) {
+            num_occupied_cells_in_555_region_to_account_for = num_occupied_cells_in_555_region_per_thread;
+        }
+
+        uint32_t occupied_cell_prefix_sum = subgroupExclusiveAdd(num_occupied_cells_in_555_region_to_account_for);
+
+        if(encodes_555_region) {
+            uint32_t complete_local_occupancy_pattern = occupancy_bit_pattern_core_cells | occupancy_bit_pattern_padding_cells_444;
+
+            uvec3 three_d_base_index = ((level_1_z_order_id & 0x1) << 1);
+            uint32_t flat_base_index = three_d_base_index.x + three_d_base_index.y * 5 + three_d_base_index.z * 25;
+            for(int32_t cell_indices_to_check = 0; cell_indices_to_check < 26; ++cell_indices_to_check) {
+                if(0 != ((1 << cell_indices_to_check) & complete_local_occupancy_pattern)) {
+                    uint8_t index_to_write = uint8_t(flat_base_index) + flat_block_reconstruction_offset_medium_area[cell_indices_to_check];
+                    OUT.occupied_cells_less_than_995[occupied_cell_prefix_sum++] = uint8_t(index_to_write);
+                }
+            }
+        }
+
+        uint mode_write_offset = subgroupExclusiveAdd(uint32_t(does_thread_participate_actively_in_mode_prefix_sum));
+
+        uint32_t inter_warp_vertex_extraction_offset = does_thread_participate_actively_in_mode_prefix_sum
+            ? (encodes_555_region
+                ? (((complete_number_of_vertices_and_triangles_in_medium_region >> 11) & 0x7FF)
+                   + occupied_cell_counters[PADDING_CELLS_MEDIUM_SIZED_REGION_COUNT_ARRAY_ID] * 2)
+                : (num_vertices_to_extract_core_cells
+                   + occupied_cell_counters[PADDING_CELLS_SMALLEST_REGION_COUNT_ARRAY_ID] * 2))
+            : 0;
+
+        uint32_t exclusiveVertexPrefixSum = subgroupExclusiveAdd(inter_warp_vertex_extraction_offset);
+
+        uint32_t global_triangle_extraction_offset = does_thread_participate_actively_in_mode_prefix_sum
+            ? (encodes_555_region
+                ? ((complete_number_of_vertices_and_triangles_in_medium_region) & 0x7FF)
+                : num_triangles_to_extract_core_cells)
+            : 0;
+
+        uint32_t exclusiveTrianglePrefixSum = subgroupExclusiveAdd(global_triangle_extraction_offset);
+
+        uint32_t prefix_sum_for_555_encoded_regions = 0;
+        if(encodes_555_region && does_thread_participate_actively_in_mode_prefix_sum) {
+            prefix_sum_for_555_encoded_regions = complete_number_of_cells_in_555_region;
+        }
+
+        uint32_t occupied_cell_prefix_sum_for_555_blocks = subgroupInclusiveAdd(prefix_sum_for_555_encoded_regions);
+
+        if(does_thread_participate_actively_in_mode_prefix_sum) {
+            OUT.dense_occupied_333_or_555_block_indices_and_size_mode[mode_write_offset] = uint8_t(gl_LocalInvocationIndex | ((encodes_333_region ? SMALLEST_REGION : MEDIUM_SIZED_REGION) << 6));
+            OUT.num_active_cells_in_555_or_995_area_inclusive_prefix_sum[mode_write_offset] = occupied_cell_prefix_sum_for_555_blocks;
+            OUT.local_vertex_and_triangle_offset_per_meshlet[mode_write_offset] = exclusiveVertexPrefixSum << 16 | exclusiveTrianglePrefixSum;
+        }
+
+        // let the last thread summarize our global storage buffer triangle, vertex and meshlet descriptor offsets based on the actual number of geometry to extract
+        if(31 == gl_LocalInvocationIndex) {
+            NUM_MESH_SHADER_WORKGROUPS_TO_EMIT = mode_write_offset + uint32_t(does_thread_participate_actively_in_mode_prefix_sum);
+            decoded_num_vertices_and_triangles_large_region.x = int(exclusiveVertexPrefixSum + inter_warp_vertex_extraction_offset);
+            decoded_num_vertices_and_triangles_large_region.y = int(exclusiveTrianglePrefixSum + global_triangle_extraction_offset);
+        }
+    }
+
+    //write the common attributes for all threads into shared task-mesh shader interface
+    if(31 == gl_LocalInvocationIndex) {
+        //encodes the 1D index of the large 8x8x4 voxel extraction block size
+        OUT.baseID = occupied_block_index;
+
+        const uint32_t meshlet_offset = atomicAdd(num_extracted_meshlets_task_mesh_shader_counter, NUM_MESH_SHADER_WORKGROUPS_TO_EMIT);
+
+        OUT.atomic_meshlet_descriptor_write_offset = meshlet_offset;
+        dense_meshlet_group_offset_and_length[gl_WorkGroupID.x] = ((meshlet_offset << 6) | NUM_MESH_SHADER_WORKGROUPS_TO_EMIT);
+
+        extraction_block_id_as_culling_info[gl_WorkGroupID.x] = occupied_block_index;
+
+        OUT.global_extraction_vertex_offset = atomicAdd(num_extracted_vertices_atomic_counter, decoded_num_vertices_and_triangles_large_region.x);
+        OUT.global_extraction_triangle_offset = atomicAdd(num_extracted_indices_atomic_counter, decoded_num_vertices_and_triangles_large_region.y);
+    }
+
+    //the *_NV* and *_EXT* task shader submission interfaces have different semantics, such that one needs to act slightly different
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+    NUM_MESH_SHADER_WORKGROUPS_TO_EMIT = subgroupBroadcast(NUM_MESH_SHADER_WORKGROUPS_TO_EMIT, 31);
+    write_num_mesh_shader_workgroups_to_emit(NUM_MESH_SHADER_WORKGROUPS_TO_EMIT);
+#else
+    if(31 == gl_LocalInvocationIndex) {
+        write_num_mesh_shader_workgroups_to_emit(NUM_MESH_SHADER_WORKGROUPS_TO_EMIT);
+    }
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+}

@@ -1,0 +1,184 @@
+#version 460
+
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+#extension GL_EXT_mesh_shader : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#else
+#define USES_NV_MESH_SHADER_EXTENSION
+#extension GL_NV_mesh_shader : require
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+
+
+
+#define SHADER_VARIANT_LOCAL_8_BIT_INDICES
+
+
+#include "../../shader_includes/abstract_task_shader_submission_interface.glsl"
+#include "../../shader_includes/atomic_counters.glsl"
+
+#include "../../shader_includes/ubos.glsl"
+#include "../../shader_includes/ssbos.glsl"
+#include "../../shader_includes/volumes.glsl"
+
+#include "../../shader_includes/culling.glsl"
+
+
+
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+struct task_to_mesh_shader_extraction_payload {
+    #include "triangle_forward_rendering_task_mesh_shader_interface.glsl"
+};
+ taskPayloadSharedEXT task_to_mesh_shader_extraction_payload OUT;
+#else //USES_NV_MESH_SHADER_EXTENSION
+taskNV out Task {
+    #include "triangle_forward_rendering_task_mesh_shader_interface.glsl"
+} OUT;
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+
+layout(local_size_x=32) in;
+
+
+vec3 normalized_cube_coordinates[8] = {
+  {0, 0, 0}, {1, 0, 0},
+  {0, 1, 0}, {1, 1, 0},
+  {0, 0, 1}, {1, 0, 1},
+  {0, 1, 1}, {1, 1, 1}
+};
+
+
+//uniform int total_num_meshlets_available;
+
+void main() {
+
+
+uint32_t global_thread_idx = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
+bool is_not_culled = true;
+
+if(global_thread_idx >= 
+#ifndef USE_MESHOPTIMIZER_STYLE_RENDERER
+persistent_extraction_num_occupied_blocks_atomic_counter
+#else //USE_MESHOPTIMIZER_STYLE_RENDERER
+num_extracted_meshlets_task_mesh_shader_counter
+#endif //USE_MESHOPTIMIZER_STYLE_RENDERER
+) {
+    is_not_culled = false;
+}
+
+
+#ifndef USE_MESHOPTIMIZER_STYLE_RENDERER
+  uint looked_up_occupied_index = extraction_block_id_as_culling_info[global_thread_idx];
+
+
+  uvec3 num_bricks_in_volume = uvec3(extraction_parameters_UBO.volume_resolution.xyz / uvec3(UNPADDED_WG_SIZE_X, UNPADDED_WG_SIZE_Y, UNPADDED_WG_SIZE_Z));
+  ivec3 brick_offset_in_voxels = ivec3( unflatten_id(looked_up_occupied_index, num_bricks_in_volume) ) * ivec3(UNPADDED_WG_SIZE_X, UNPADDED_WG_SIZE_Y, UNPADDED_WG_SIZE_Z);
+
+  vec3 voxel_center 
+    = brick_offset_in_voxels + 0.5f;
+
+  vec3 bbox_min = (voxel_center + normalized_cube_coordinates[0] * ivec3(UNPADDED_WG_SIZE_X, UNPADDED_WG_SIZE_Y, UNPADDED_WG_SIZE_Z) ) 
+      * extraction_parameters_UBO.voxel_size.xyz;
+  vec3 bbox_max = (voxel_center + normalized_cube_coordinates[7] * ivec3(UNPADDED_WG_SIZE_X, UNPADDED_WG_SIZE_Y, UNPADDED_WG_SIZE_Z) ) 
+      * extraction_parameters_UBO.voxel_size.xyz;
+
+  // frustum and pixel cull
+  vec4 hPos0    = combined_model_culling_reference_camera_UBO.model_view_projection_mat * getBoxCorner(vec4(bbox_min, 1.0), vec4(bbox_max, 1.0), 0);
+  vec3 clipmin  = projected(hPos0);
+  vec3 clipmax  = clipmin;
+  uint clipbits = getCullBits(hPos0);
+
+  for (int n = 1; n < 8; n++){
+    vec4 hPos   = combined_model_culling_reference_camera_UBO.model_view_projection_mat * getBoxCorner(vec4(bbox_min, 1.0), vec4(bbox_max, 1.0), n);
+    vec3 ab     = projected(hPos);
+    clipmin = min(clipmin,ab);
+    clipmax = max(clipmax,ab);
+    clipbits &= getCullBits(hPos);
+  }    
+      
+  if (clipbits != 0 )
+  {
+    // invisible
+    // skip rasterization of this box
+    is_not_culled = false;
+  }
+
+
+#ifdef TASK_NO_CULLING_EFFECT
+  is_not_culled = true;
+#endif //endif
+
+#else  //USE_MESHOPTIMIZER_STYLE_RENDERER
+
+
+if(global_thread_idx < num_extracted_meshlets_task_mesh_shader_counter) {
+    meshopt_bounds meshlet_culling_info = meshopt_style_bounds[global_thread_idx];
+
+    vec3 view_space_center = (combined_model_culling_reference_camera_UBO.model_view_mat * vec4(meshlet_culling_info.center_and_radius.xyz, 1.0) ).xyz;
+
+    is_not_culled =
+    is_not_culled &&  view_space_center.z * culling_reference_camera_UBO.frustum_planes[1] - abs(view_space_center.x) * culling_reference_camera_UBO.frustum_planes[0] > -(meshlet_culling_info.center_and_radius.w );
+
+    is_not_culled = 
+    is_not_culled &&  view_space_center.z * culling_reference_camera_UBO.frustum_planes[3] - abs(view_space_center.y) * culling_reference_camera_UBO.frustum_planes[2] > -(meshlet_culling_info.center_and_radius.w);
+
+    is_not_culled = 
+    is_not_culled && 
+    (-view_space_center.z + meshlet_culling_info.center_and_radius.w >= culling_reference_camera_UBO.near_far_padding_x2.x ) &&
+    (-view_space_center.z - meshlet_culling_info.center_and_radius.w <= culling_reference_camera_UBO.near_far_padding_x2.y );// && -view_space_center.z - scaled_radius < near_far_padding_x2.y);
+
+} else {
+    is_not_culled = false;
+}
+
+#endif //USE_MESHOPTIMIZER_STYLE_RENDERER
+
+#ifndef USE_MESHOPTIMIZER_STYLE_RENDERER
+  const uint32_t visible_meshlet_group_offset_and_length = dense_meshlet_group_offset_and_length[global_thread_idx];
+  const uint32_t meshlet_read_offset = visible_meshlet_group_offset_and_length >> 6;
+  const uint32_t NUM_MESHLETS_EXTRACTED_FROM_BLOCK = visible_meshlet_group_offset_and_length & 0x3F;
+#else
+//offline extracted meshlets are handled individually
+  const uint32_t NUM_MESHLETS_EXTRACTED_FROM_BLOCK = 1u;
+#endif //USE_MESHOPTIMIZER_STYLE_RENDERER
+
+  const uint32_t visible_item_count = (is_not_culled) ? NUM_MESHLETS_EXTRACTED_FROM_BLOCK : 0u;
+
+  uint32_t visible_item_offset_write = subgroupExclusiveAdd(visible_item_count);
+
+
+  uint32_t total_num_visible_meshlets = visible_item_offset_write + visible_item_count;
+
+
+  #ifdef USES_EXT_MESH_SHADER_EXTENSION
+  total_num_visible_meshlets = subgroupBroadcast(total_num_visible_meshlets, 31);
+  #endif
+
+
+  if(total_num_visible_meshlets > 0) {
+      #ifndef USE_MESHOPTIMIZER_STYLE_RENDERER
+      if(visible_item_count > 0) {
+          for(uint32_t local_visible_item_index = 0; local_visible_item_index < visible_item_count; ++local_visible_item_index) {
+             OUT.absoluteIDs[visible_item_offset_write + local_visible_item_index] = meshlet_read_offset + local_visible_item_index;
+          }
+      }
+      #else //USE_MESHOPTIMIZER_STYLE_RENDERER
+      if(1 == visible_item_count) {
+        OUT.baseID = gl_WorkGroupID.x * gl_WorkGroupSize.x;
+        OUT.baseIDOffset[visible_item_offset_write] = uint8_t(gl_LocalInvocationIndex);
+      }
+      #endif //USE_MESHOPTIMIZER_STYLE_RENDERER
+
+
+  }
+
+  #ifdef USES_NV_MESH_SHADER_EXTENSION
+  if(31 == gl_LocalInvocationIndex) {
+  #endif //USES_NV_MESH_SHADER_EXTENSION
+    write_num_mesh_shader_workgroups_to_emit(total_num_visible_meshlets);
+  #ifdef USES_NV_MESH_SHADER_EXTENSION
+   }
+  #endif //USES_NV_MESH_SHADER_EXTENSION
+
+}

@@ -1,0 +1,52 @@
+#version 460 core
+
+#ifdef USES_EXT_MESH_SHADER_EXTENSION
+#extension GL_EXT_mesh_shader : require
+#else
+#extension GL_NV_mesh_shader : require
+#endif //USES_EXT_MESH_SHADER_EXTENSION
+
+#extension GL_KHR_shader_subgroup_basic : require
+
+//mesh shader config related
+layout(local_size_x=12) in;
+layout(max_vertices=8, max_primitives=12) out;
+layout(lines) out; 
+
+//own shader includes
+#define PRIMITIVE_TYPE_LINE_LIST
+#include "../shader_includes/abstract_mesh_shader_submission_interface.glsl"
+#include "../shader_includes/const_memory_geometry.glsl"
+#include "../shader_includes/volumes.glsl"
+#include "../shader_includes/ubos.glsl"
+
+//varyings
+layout (location = 0) out Interpolant {
+flat uint volume_id;
+} OUT[];
+
+
+//actual functionality
+void main() {  
+  if(gl_LocalInvocationIndex < 8) {
+    vec4 vertex_position_to_project 
+    =  normalized_cube_coordinates[gl_LocalInvocationIndex];
+
+	vec4 mvp_cube_corner = combined_model_point_of_view_camera_UBO.model_view_projection_mat * vertex_position_to_project;
+	write_position_extension_independent(gl_LocalInvocationIndex, mvp_cube_corner);
+  }
+
+	const uint base_per_component_offset = 2 * gl_LocalInvocationIndex;
+	const uvec2 indices_to_write 
+		= uvec2(normalized_cube_indices_lines[base_per_component_offset], 
+				normalized_cube_indices_lines[base_per_component_offset + 1]
+				);
+
+	write_line_primitive_indices_extension_independent(gl_LocalInvocationIndex, indices_to_write);
+	
+
+
+  if(0 == gl_LocalInvocationIndex) {
+	write_num_primitives_extension_independent(8, 12);
+  }
+}

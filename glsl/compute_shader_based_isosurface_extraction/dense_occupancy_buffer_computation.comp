@@ -1,0 +1,82 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+
+#include "../shader_includes/volumes.glsl"
+#include "../shader_includes/ssbos.glsl"
+#include "../shader_includes/atomic_counters.glsl"
+
+layout(rg32f, binding = 2) uniform readonly image3D min_max_image_blockwise;
+
+#define NUM_THREADS_IN_BLOCK (UNPADDED_WG_SIZE_X * UNPADDED_WG_SIZE_Y * UNPADDED_WG_SIZE_Z)
+
+layout(local_size_x = UNPADDED_WG_SIZE_X, local_size_y = UNPADDED_WG_SIZE_Y, local_size_z = UNPADDED_WG_SIZE_Z) in;
+
+const uint NUM_ACTIVE_WARPS = uint( (NUM_THREADS_IN_BLOCK + 31) / 32 );
+
+shared uint shared_is_block_occupied[NUM_ACTIVE_WARPS + 1];// = {0, 0, 0, 0 ,0} ;
+
+void main() {
+     ivec3 min_max_voxel_read_offset = ivec3(gl_GlobalInvocationID);// ivec3(gl_WorkGroupID.xyz * gl_WorkGroupSize.xyz) + ivec3(gl_LocalInvocationID);
+
+     vec2 looked_up_min_max_voxel = imageLoad(min_max_image_blockwise, min_max_voxel_read_offset).xy;
+
+     uint warp_idx = gl_LocalInvocationIndex / 32;
+     uint lane_idx = gl_LocalInvocationIndex % 32;
+
+     bool is_block_occupied = false;
+     if( (looked_up_min_max_voxel.x < extraction_parameters_UBO.iso_value) && (extraction_parameters_UBO.iso_value < looked_up_min_max_voxel.y) ) {
+       is_block_occupied = true;
+     }
+
+     const uint LAST_ACTIVE_LANE_IDX = ((warp_idx+1) * 32 <= NUM_THREADS_IN_BLOCK) ? 31 : ((NUM_THREADS_IN_BLOCK % 32) - 1);
+
+     uint intra_warp_offset = subgroupBallotExclusiveBitCount(subgroupBallot(is_block_occupied));
+     
+     if(LAST_ACTIVE_LANE_IDX == lane_idx) {
+       shared_is_block_occupied[warp_idx] = intra_warp_offset + (is_block_occupied ? 1 : 0);
+     }
+     barrier();
+
+     if(0 == warp_idx) {
+       uint intra_block_results = 0;
+       if(lane_idx < NUM_ACTIVE_WARPS) {
+         intra_block_results = shared_is_block_occupied[lane_idx];
+       }
+       
+       intra_block_results = subgroupExclusiveAdd(intra_block_results);
+
+       if(lane_idx < NUM_ACTIVE_WARPS) {
+         shared_is_block_occupied[lane_idx] = intra_block_results;
+       }
+
+       if(NUM_ACTIVE_WARPS == lane_idx) {
+         shared_is_block_occupied[lane_idx] 
+            = atomicAdd(persistent_extraction_num_occupied_blocks_atomic_counter, intra_block_results);  //<- block global number of elements in blocks
+       }
+     }
+
+     barrier();
+
+     uint intra_block_offset = shared_is_block_occupied[warp_idx];
+     //read global block offset
+     uint inter_block_offset = 0;
+     if(0 == lane_idx) {
+       inter_block_offset = shared_is_block_occupied[NUM_ACTIVE_WARPS];
+     }
+
+     inter_block_offset = subgroupBroadcast(inter_block_offset, 0);
+
+     if(is_block_occupied) {
+       uint unique_write_idx = inter_block_offset + intra_block_offset + intra_warp_offset;
+
+       ivec3 num_blocks_in_vol = volTexSize / ivec3(UNPADDED_WG_SIZE_X, UNPADDED_WG_SIZE_Y, UNPADDED_WG_SIZE_Z);
+       uint block_idx = flatten_id(min_max_voxel_read_offset, num_blocks_in_vol);
+       dense_occupied_block_indices[unique_write_idx] = block_idx;
+     }
+ 
+
+
+}

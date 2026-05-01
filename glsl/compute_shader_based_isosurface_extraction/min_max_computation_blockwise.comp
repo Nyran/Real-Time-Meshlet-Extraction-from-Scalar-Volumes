@@ -1,0 +1,67 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+#include "../shader_includes/atomic_counters.glsl"
+#include "../shader_includes/volumes.glsl"
+#include "../shader_includes/ssbos.glsl"
+
+
+#define FLT_MAX (3.402823466e+38)
+#define FLT_MIN (1.175494351e-38)
+
+layout(rg32f, binding = 2) uniform image3D min_max_image_blockwise;
+
+
+layout(local_size_x = PADDED_WG_SIZE_X, local_size_y = PADDED_WG_SIZE_Y, local_size_z = PADDED_WG_SIZE_Z) in;
+
+const uint NUM_ACTIVE_WARPS = uint( (PADDED_WG_SIZE_X * PADDED_WG_SIZE_Y * PADDED_WG_SIZE_Z + 31) / 32);
+
+shared vec2 intermediate_results[NUM_ACTIVE_WARPS];
+
+void main() {
+
+   if(ivec3(0, 0, 0) == gl_GlobalInvocationID.xyz) {
+        indirect_dispatch_dim_y = 1;
+        indirect_dispatch_dim_z = 1;
+   }
+
+   ivec3 brick_offset_in_voxels = ivec3(gl_WorkGroupID.xyz * uvec3(UNPADDED_WG_SIZE_X, UNPADDED_WG_SIZE_Y, UNPADDED_WG_SIZE_Z));
+
+   ivec3 volume_integer_idx_3d = brick_offset_in_voxels + ivec3(gl_LocalInvocationID.x,  gl_LocalInvocationID.y, gl_LocalInvocationID.z);
+    
+   float sampled_value = sample_volume(brick_offset_in_voxels + ivec3(gl_LocalInvocationID.xyz) );
+   float intra_warp_min = sampled_value;
+   float intra_warp_max = sampled_value;
+
+   intra_warp_min = subgroupMin(intra_warp_min);
+   intra_warp_max = subgroupMax(intra_warp_max);
+
+
+   uint warp_idx = gl_LocalInvocationIndex / 32;
+   uint lane_idx = gl_LocalInvocationIndex % 32;
+
+   if(0 == lane_idx) {
+     intermediate_results[warp_idx] = vec2(intra_warp_min, intra_warp_max);
+   }
+   barrier();
+
+   if(0 == warp_idx) {
+
+     vec2 looked_up_min_max = {FLT_MAX, -FLT_MAX};
+      
+     if(lane_idx < NUM_ACTIVE_WARPS) {
+       looked_up_min_max = intermediate_results[lane_idx];
+     }
+
+     // after the subgroup min and max operations the variables called 'intra_warp_min' and 'intra_warp_max' will actually contain
+     // the block-wide min and max values
+     intra_warp_min = subgroupMin(looked_up_min_max.x);
+     intra_warp_max = subgroupMax(looked_up_min_max.y);
+
+     if(0 == lane_idx) {
+       imageStore(min_max_image_blockwise, ivec3(gl_WorkGroupID), vec4(vec2(intra_warp_min, intra_warp_max), 0.0, 1.0));
+     }
+   }
+}

@@ -1,0 +1,46 @@
+---
+# clang-tidy configuration for the isosurface_rendering_framework codebase.
+#
+# Activated via the ENABLE_CLANG_TIDY CMake option (see top-level CMakeLists.txt).
+# Only headers under framework/ and apps/ are diagnosed (HeaderFilterRegex below);
+# vendored sources under external/ have their own .clang-tidy that disables checks.
+
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  readability-*,
+  cppcoreguidelines-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -modernize-use-trailing-return-type,
+  -modernize-use-nodiscard,
+  -modernize-avoid-c-arrays,
+  -modernize-pass-by-value,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -readability-function-cognitive-complexity,
+  -readability-uppercase-literal-suffix,
+  -readability-implicit-bool-conversion,
+  -readability-named-parameter,
+  -readability-braces-around-statements,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-union-access,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+  -cppcoreguidelines-narrowing-conversions,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-init-variables
+
+WarningsAsErrors: ''
+
+# Only diagnose headers inside framework/ and apps/. This is a regex matched
+# against absolute paths, so we anchor on those two directory names.
+HeaderFilterRegex: '.*[\\/](framework|apps)[\\/].*'
+
+FormatStyle: file

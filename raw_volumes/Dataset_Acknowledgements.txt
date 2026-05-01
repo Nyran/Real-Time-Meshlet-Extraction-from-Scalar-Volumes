@@ -1,0 +1,3 @@
+The chameleon dataset, which we filtered and downsampled to a resolution of 256x256x256 voxels, is courtesy of Digital Morphology Project at the University of Texas at Austin, USA.
+
+The vertebra8 dataset is courtesy of the Volvis Project Group of Tübingen University, Germany and Michael Meißner, Viatronix Inc., USA.
