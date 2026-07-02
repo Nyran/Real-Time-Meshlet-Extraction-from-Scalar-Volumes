@@ -1,4 +1,4 @@
-![Teaser of our Real-Time Meshlet Extraction Approach comparing against a state-of-the-art real-time indexed triangle extraction approach and offline created meshlets.](https://github.com/Nyran/Real-Time-Meshlet-Extraction-from-Scalar-Volumes/paper_teaser/teaser.jpg)
+![Teaser of our Real-Time Meshlet Extraction Approach comparing against a state-of-the-art real-time indexed triangle extraction approach and offline created meshlets.](https://github.com/Nyran/Real-Time-Meshlet-Extraction-from-Scalar-Volumes/blob/main/paper_teaser/teaser.jpg?raw=true)
 
 # Supplementary Core Framework Code for EGPGV 2026 paper: Real-Time Meshlet Extraction from Scalar Volumes
 
